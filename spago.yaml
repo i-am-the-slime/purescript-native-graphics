@@ -1,0 +1,11 @@
+package:
+  name: native-graphics
+  dependencies:
+    - prelude
+    - effect
+  publish:
+    version: 0.0.1
+    license: MIT
+    location:
+      githubOwner: i-am-the-slime
+      githubRepo: purescript-native-graphics
