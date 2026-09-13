@@ -2,14 +2,13 @@ package graphics
 
 import (
 	"github.com/hajimehoshi/ebiten/v2"
-	"github.com/i-am-the-slime/purescript-native-graphics/drawing"
 	"image"
 )
 
 // Capture runs the actual GPU drawing backend and reads its framebuffer. It
 // needs a native window because Ebiten creates the device inside RunGame.
-func Capture(w, h int, d *drawing.Drawing) (image.Image, error) {
-	g := &captureGame{width: w, height: h, drawing: d}
+func Capture(w, h int, render func(*ebiten.Image)) (image.Image, error) {
+	g := &captureGame{width: w, height: h, render: render}
 	ebiten.SetWindowSize(w, h)
 	ebiten.SetWindowTitle("")
 	ebiten.SetWindowIcon(windowIcons)
@@ -21,7 +20,7 @@ func Capture(w, h int, d *drawing.Drawing) (image.Image, error) {
 
 type captureGame struct {
 	width, height int
-	drawing       *drawing.Drawing
+	render        func(*ebiten.Image)
 	image         *image.RGBA
 	done          bool
 	failure       error
@@ -46,7 +45,7 @@ func (g *captureGame) Draw(*ebiten.Image) {
 	g.done = true
 	target := ebiten.NewImage(g.width, g.height)
 	defer target.Dispose()
-	RenderEbiten(target, g.drawing, false)
+	g.render(target)
 	buffer := make([]byte, 4*g.width*g.height)
 	target.ReadPixels(buffer)
 	g.image = &image.RGBA{Pix: buffer, Stride: 4 * g.width, Rect: image.Rect(0, 0, g.width, g.height)}

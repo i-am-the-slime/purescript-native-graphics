@@ -5,7 +5,6 @@ package graphics
 import (
 	"github.com/i-am-the-slime/purescript-native-graphics/metaldarwin"
 	. "github.com/purescript-native/go-runtime"
-	"math"
 	"time"
 )
 
@@ -23,7 +22,7 @@ func configureWindow(d Dict) error {
 	}
 	return metaldarwin.Configure(cfg)
 }
-func runMetal(opts windowOptions, callback func(Dict) windowOutput) error {
+func runMetal(opts windowOptions, callback func(Dict) windowOutput, renderer metalRenderer) error {
 	metaldarwin.Setup(opts.Width, opts.Height)
 	metaldarwin.SetTitle(opts.Title)
 	defer metaldarwin.Stop()
@@ -44,15 +43,7 @@ func runMetal(opts windowOptions, callback func(Dict) windowOutput) error {
 		last = now
 		vw, vh := metaldarwin.ViewportSize()
 		mx, my, down := metaldarwin.MouseState()
-		scale := math.Min(float64(vw)/float64(opts.FrameWidth), float64(vh)/float64(opts.FrameHeight))
-		ox := (float64(vw) - float64(opts.FrameWidth)*scale) / 2
-		oy := (float64(vh) - float64(opts.FrameHeight)*scale) / 2
-		x, y := float64(mx), float64(my)
-		if scale > 0 {
-			x = (x - ox) / scale
-			y = (y - oy) / scale
-		}
-		in := Dict{"deltaSeconds": delta, "mouseX": x, "mouseY": y, "mouseDown": down, "mouseInside": x >= 0 && y >= 0 && x < float64(opts.FrameWidth) && y < float64(opts.FrameHeight), "spaceDown": metaldarwin.KeyDown(metaldarwin.KeySpace), "leftDown": metaldarwin.KeyDown(metaldarwin.KeyLeft), "rightDown": metaldarwin.KeyDown(metaldarwin.KeyRight), "homeDown": metaldarwin.KeyDown(metaldarwin.KeyHome), "endDown": metaldarwin.KeyDown(metaldarwin.KeyEnd), "tDown": metaldarwin.KeyDown(metaldarwin.KeyT), "qDown": metaldarwin.KeyDown(metaldarwin.KeyQ), "escapeDown": metaldarwin.KeyDown(metaldarwin.KeyEscape), "closeRequested": metaldarwin.QuitRequested()}
+		in := Dict{"deltaSeconds": delta, "mouseX": float64(mx), "mouseY": float64(my), "mouseDown": down, "frameWidth": opts.FrameWidth, "frameHeight": opts.FrameHeight, "viewportWidth": float64(vw), "viewportHeight": float64(vh), "spaceDown": metaldarwin.KeyDown(metaldarwin.KeySpace), "leftDown": metaldarwin.KeyDown(metaldarwin.KeyLeft), "rightDown": metaldarwin.KeyDown(metaldarwin.KeyRight), "homeDown": metaldarwin.KeyDown(metaldarwin.KeyHome), "endDown": metaldarwin.KeyDown(metaldarwin.KeyEnd), "tDown": metaldarwin.KeyDown(metaldarwin.KeyT), "qDown": metaldarwin.KeyDown(metaldarwin.KeyQ), "escapeDown": metaldarwin.KeyDown(metaldarwin.KeyEscape), "closeRequested": metaldarwin.QuitRequested()}
 		out := callback(in)
 		if out.Quit {
 			metaldarwin.Stop()
@@ -66,23 +57,9 @@ func runMetal(opts windowOptions, callback func(Dict) windowOutput) error {
 			metaldarwin.Resize(opts.Width, opts.Height)
 		}
 		vw, vh = metaldarwin.ViewportSize()
-		scale = math.Min(float64(vw)/float64(opts.FrameWidth), float64(vh)/float64(opts.FrameHeight))
-		ox = (float64(vw) - float64(opts.FrameWidth)*scale) / 2
-		oy = (float64(vh) - float64(opts.FrameHeight)*scale) / 2
-		metaldarwin.SetDragExclusion(ox+out.DragX*scale, oy+out.DragY*scale, out.DragWidth*scale, out.DragHeight*scale)
-		if err := metaldarwin.Prepare(out.Drawing); err != nil {
-			renderError = err
-			metaldarwin.Stop()
-			return
-		}
-		clear := out.Drawing.Clear
-		if !metaldarwin.FrameBegin(clear[0], clear[1], clear[2], clear[3]) {
-			return
-		}
-		rw, rh := metaldarwin.ViewportSize()
-		metaldarwin.Render(out.Drawing, float64(rw), float64(rh))
-		metaldarwin.RenderOverlay(out.Overlay, float64(rw), float64(rh), float64(opts.FrameWidth), float64(opts.FrameHeight))
-		metaldarwin.FrameEnd()
+		rect := renderer.viewportRect(float64(vw), float64(vh), opts.FrameWidth, opts.FrameHeight, out.DragExclusion)
+		metaldarwin.SetDragExclusion(number(rect["x"]), number(rect["y"]), number(rect["width"]), number(rect["height"]))
+		renderer.render(out.Drawing, out.Overlay, float64(vw), float64(vh), opts.FrameWidth, opts.FrameHeight)
 	})
 	defer metaldarwin.SetTickFunc(nil)
 	metaldarwin.StartTick(opts.FPS)

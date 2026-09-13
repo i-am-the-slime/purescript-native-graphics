@@ -1,11 +1,5 @@
 module Native.Graphics
-  ( Drawing
-  , Image
-  , Bytes
-  , Command
-  , Layer
-  , Composite
-  , makeDrawing
+  ( module Types
   , rasterize
   , capture
   , encodePng
@@ -15,41 +9,29 @@ module Native.Graphics
   ) where
 
 import Prelude
+
 import Effect (Effect)
+import Native.Graphics.Ebiten as Ebiten
+import Native.Graphics.Font as Font
+import Native.Graphics.Raster as Raster
+import Native.Graphics.Types (Bytes, Drawing, Image)
+import Native.Graphics.Types (BlendMode(..), Bytes, CirclePatternSpec, Color, Command(..), Composite, Drawing, FillRule(..), Image, LatticeSpec, Layer, LayerId(..), LineCap(..), LineJoin(..), Path, PathOp(..), Point, Rect, StrokeStyle, TextAlign(..), TextBaseline(..), TextSpec, Transform) as Types
 
-type Command =
-  { kind :: Int
-  , args :: Array Number
-  , path :: Array Number
-  , text :: String
-  , font :: String
-  , fontID :: Int
-  }
+rasterize :: Int -> Int -> Drawing -> Effect Image
+rasterize = Raster.rasterize
 
-type Layer = { global :: Boolean }
+capture :: Int -> Int -> Drawing -> Effect Image
+capture width height drawing = do
+  render <- Ebiten.create
+  captureImpl width height (\target -> render target drawing false)
 
-type Composite =
-  { source :: Int
-  , mask :: Int
-  , invertMask :: Boolean
-  , blend :: Int
-  }
+registerFont :: { name :: String, data :: Bytes, features :: String } -> Effect Unit
+registerFont = Font.registerFont
 
-foreign import data Drawing :: Type
-foreign import data Image :: Type
-foreign import data Bytes :: Type
+foreign import captureImpl :: Int -> Int -> (Image -> Effect Unit) -> Effect Image
 
-foreign import makeDrawing
-  :: { commands :: Array Command
-     , layers :: Array Layer
-     , composite :: Array Composite
-     , clear :: Array Number
-     }
-  -> Drawing
-
-foreign import rasterize :: Int -> Int -> Drawing -> Effect Image
-foreign import capture :: Int -> Int -> Drawing -> Effect Image
 foreign import encodePng :: Image -> Effect (Array Int)
+
 foreign import encodePngBytes :: Image -> Effect Bytes
+
 foreign import bytesFromBase64 :: String -> Bytes
-foreign import registerFont :: { name :: String, data :: Bytes, features :: String } -> Effect Unit

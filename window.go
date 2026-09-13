@@ -2,42 +2,50 @@ package graphics
 
 import (
 	"github.com/hajimehoshi/ebiten/v2"
-	"github.com/i-am-the-slime/purescript-native-graphics/drawing"
 	. "github.com/purescript-native/go-runtime"
 )
 
 type windowOptions struct {
-	Backend, Title                              string
+	Title                                       string
 	Width, Height, FrameWidth, FrameHeight, FPS int
 }
 type windowOutput struct {
-	Drawing, Overlay                                   *drawing.Drawing
+	Drawing, Overlay                                   Any
 	Quit                                               bool
 	FrameWidth, FrameHeight, WindowWidth, WindowHeight int
-	DragX, DragY, DragWidth, DragHeight                float64
+	DragExclusion                                      Dict
 }
 
 func decodeOutput(d Dict) windowOutput {
 	r := d["dragExclusion"].(Dict)
-	return windowOutput{Drawing: d["drawing"].(*drawing.Drawing), Overlay: d["overlay"].(*drawing.Drawing), Quit: d["quit"].(bool), FrameWidth: integer(d["frameWidth"]), FrameHeight: integer(d["frameHeight"]), WindowWidth: integer(d["windowWidth"]), WindowHeight: integer(d["windowHeight"]), DragX: number(r["x"]), DragY: number(r["y"]), DragWidth: number(r["width"]), DragHeight: number(r["height"])}
+	return windowOutput{Drawing: d["drawing"], Overlay: d["overlay"], Quit: d["quit"].(bool), FrameWidth: integer(d["frameWidth"]), FrameHeight: integer(d["frameHeight"]), WindowWidth: integer(d["windowWidth"]), WindowHeight: integer(d["windowHeight"]), DragExclusion: r}
 }
-func runWindow(opts windowOptions, callback func(Dict) windowOutput) error {
-	if opts.Backend == "metal" {
-		return runMetal(opts, callback)
-	}
-	return runEbiten(opts, callback)
+
+type windowRenderer func(*ebiten.Image, Any, Any)
+type metalRenderer struct {
+	render       func(Any, Any, float64, float64, int, int)
+	viewportRect func(float64, float64, int, int, Dict) Dict
+}
+
+func decodeOptions(d Dict) windowOptions {
+	return windowOptions{Title: d["title"].(string), Width: integer(d["width"]), Height: integer(d["height"]), FrameWidth: integer(d["frameWidth"]), FrameHeight: integer(d["frameHeight"]), FPS: integer(d["fps"])}
+}
+
+func decodeCallback(callback Any) func(Dict) windowOutput {
+	return func(in Dict) windowOutput { return decodeOutput(Run(Apply(callback, in)).(Dict)) }
 }
 
 type nativeGame struct {
 	options   windowOptions
 	callback  func(Dict) windowOutput
+	render    windowRenderer
 	output    windowOutput
 	hasOutput bool
 	failure   error
 }
 
-func runEbiten(opts windowOptions, callback func(Dict) windowOutput) error {
-	g := &nativeGame{options: opts, callback: callback}
+func runEbiten(opts windowOptions, callback func(Dict) windowOutput, render windowRenderer) error {
+	g := &nativeGame{options: opts, callback: callback, render: render}
 	ebiten.SetWindowSize(opts.Width, opts.Height)
 	ebiten.SetWindowTitle(opts.Title)
 	ebiten.SetWindowResizingMode(ebiten.WindowResizingModeEnabled)
@@ -58,7 +66,7 @@ func (g *nativeGame) Update() (err error) {
 	// Update is a logical tick: Ebiten drops excess elapsed wall time after stalls.
 	delta := 1.0 / float64(ebiten.TPS())
 	x, y := ebiten.CursorPosition()
-	in := Dict{"deltaSeconds": delta, "mouseX": float64(x), "mouseY": float64(y), "mouseDown": ebiten.IsMouseButtonPressed(ebiten.MouseButtonLeft), "mouseInside": x >= 0 && y >= 0 && x < g.options.FrameWidth && y < g.options.FrameHeight, "spaceDown": ebiten.IsKeyPressed(ebiten.KeySpace), "leftDown": ebiten.IsKeyPressed(ebiten.KeyArrowLeft), "rightDown": ebiten.IsKeyPressed(ebiten.KeyArrowRight), "homeDown": ebiten.IsKeyPressed(ebiten.KeyHome), "endDown": ebiten.IsKeyPressed(ebiten.KeyEnd), "tDown": ebiten.IsKeyPressed(ebiten.KeyT), "qDown": ebiten.IsKeyPressed(ebiten.KeyQ), "escapeDown": ebiten.IsKeyPressed(ebiten.KeyEscape), "closeRequested": ebiten.IsWindowBeingClosed()}
+	in := Dict{"deltaSeconds": delta, "mouseX": float64(x), "mouseY": float64(y), "mouseDown": ebiten.IsMouseButtonPressed(ebiten.MouseButtonLeft), "frameWidth": g.options.FrameWidth, "frameHeight": g.options.FrameHeight, "viewportWidth": float64(g.options.FrameWidth), "viewportHeight": float64(g.options.FrameHeight), "spaceDown": ebiten.IsKeyPressed(ebiten.KeySpace), "leftDown": ebiten.IsKeyPressed(ebiten.KeyArrowLeft), "rightDown": ebiten.IsKeyPressed(ebiten.KeyArrowRight), "homeDown": ebiten.IsKeyPressed(ebiten.KeyHome), "endDown": ebiten.IsKeyPressed(ebiten.KeyEnd), "tDown": ebiten.IsKeyPressed(ebiten.KeyT), "qDown": ebiten.IsKeyPressed(ebiten.KeyQ), "escapeDown": ebiten.IsKeyPressed(ebiten.KeyEscape), "closeRequested": ebiten.IsWindowBeingClosed()}
 	out := g.callback(in)
 	g.output = out
 	g.hasOutput = true
@@ -83,17 +91,6 @@ func (g *nativeGame) Draw(screen *ebiten.Image) {
 	if !g.hasOutput {
 		return
 	}
-	if g.options.Backend == "cpu" {
-		image := ebiten.NewImageFromImage(Rasterize(g.options.FrameWidth, g.options.FrameHeight, g.output.Drawing))
-		screen.Clear()
-		screen.DrawImage(image, nil)
-		image.Dispose()
-		overlay := ebiten.NewImageFromImage(Rasterize(g.options.FrameWidth, g.options.FrameHeight, g.output.Overlay))
-		screen.DrawImage(overlay, nil)
-		overlay.Dispose()
-	} else {
-		RenderEbiten(screen, g.output.Drawing, false)
-		RenderEbiten(screen, g.output.Overlay, true)
-	}
+	g.render(screen, g.output.Drawing, g.output.Overlay)
 }
 func (g *nativeGame) Layout(int, int) (int, int) { return g.options.FrameWidth, g.options.FrameHeight }

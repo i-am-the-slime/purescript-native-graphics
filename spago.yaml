@@ -1,8 +1,35 @@
 package:
   name: native-graphics
   dependencies:
-    - prelude
+    - arrays
+    - control
     - effect
+    - either
+    - enums
+    - exceptions
+    - foldable-traversable
+    - integers
+    - lists
+    - maybe
+    - numbers
+    - ordered-collections
+    - parsing
+    - prelude
+    - refs
+    - st
+    - strings
+    - tailrec
+    - tuples
+    - yoga-json
+  test:
+    main: Test.Main
+    dependencies:
+      - canvas
+      - console
+      - go-concurrent
+      - node-fs
+      - node-process
+      - web-font-loading
   publish:
     version: 0.0.1
     license: MIT

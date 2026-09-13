@@ -25,44 +25,16 @@ static id<MTLRenderPipelineState> g_pso_msdf  = nil;
 static id<MTLRenderPipelineState> g_pso_rrect = nil;
 static id<MTLRenderPipelineState> g_pso_bgdots = nil;
 static id<MTLRenderPipelineState> g_pso_lattice = nil;
-static id<MTLBuffer>       g_vbuf     = nil;
-static NSUInteger          g_vbuf_cap = 0;
-static NSUInteger          g_vbuf_off = 0;
-static id<MTLBuffer>       g_tbuf     = nil;
-static NSUInteger          g_tbuf_cap = 0;
-static NSUInteger          g_tbuf_off = 0;
-static id<MTLTexture>      g_msaa_tex      = nil;
-static id<MTLTexture>      g_stencil_tex   = nil;
-static id<MTLTexture>      g_atlas         = nil;
-
-// Indexed offscreen targets. The caller supplies layer count and composition.
-// The maximum follows Metal's fragment texture argument limit.
-#define MG_MAX_LAYERS 31
-static int g_layer_count = 1;
-#define MG_LAYER_COUNT g_layer_count
-static int g_layer_global[MG_MAX_LAYERS] = {0};
-static int g_composite[256 * 4] = {0};
-static int g_composite_count = 0;
-static id<MTLTexture>  g_layer_msaa[MG_MAX_LAYERS]    = {0};
-static id<MTLTexture>  g_layer_resolve[MG_MAX_LAYERS] = {0};
-static id<MTLTexture>  g_layer_stencil[MG_MAX_LAYERS] = {0};
-static BOOL            g_layer_visited[MG_MAX_LAYERS] = {0};
-static int             g_current_layer = -1;
+static id<MTLTexture> g_atlas = nil;
 static id<MTLRenderPipelineState> g_pso_compose = nil;
-static id<MTLSamplerState> g_sampler       = nil;
-
-// Blur capture uses a parallel set of targets, composed using the caller's
-// recipe before separable Gaussian filtering and source-over restoration.
-static BOOL            g_blur_capture = NO;
-static id<MTLTexture>  g_blur_msaa[MG_MAX_LAYERS]    = {0};
-static id<MTLTexture>  g_blur_resolve[MG_MAX_LAYERS] = {0};
-static id<MTLTexture>  g_blur_stencil[MG_MAX_LAYERS] = {0};
-static BOOL            g_blur_visited[MG_MAX_LAYERS] = {0};
-static id<MTLTexture>  g_blur_scratchA = nil;
-static id<MTLTexture>  g_blur_scratchB = nil;
-static int             g_blur_prev_layer = 0;
+static id<MTLSamplerState> g_sampler = nil;
 static id<MTLRenderPipelineState> g_pso_gauss = nil;
-static id<MTLRenderPipelineState> g_pso_blit  = nil;
+static id<MTLRenderPipelineState> g_pso_blit = nil;
+typedef struct {
+    void *color;
+    void *resolve;
+    void *stencil;
+} MgTarget;
 static id<MTLRenderPipelineState> g_pso_clip = nil;
 #define MG_CLIP_DEPTH 8
 static id<MTLDepthStencilState> g_dss_none = nil;
@@ -189,18 +161,6 @@ extern void mg_request_stop(void);
 static int mg_get_quit_requested(void) { return mg_quit_requested; }
 static void mg_set_samples(int count) { g_requested_samples = count > 0 ? count : 0; }
 
-static void mg_prepare(int count, const int *global, int opCount, const int *ops) {
-    if (count != g_layer_count) {
-        for (int i=0; i<MG_MAX_LAYERS; ++i) {
-            g_layer_msaa[i] = nil; g_layer_resolve[i] = nil; g_layer_stencil[i] = nil;
-            g_blur_msaa[i] = nil; g_blur_resolve[i] = nil; g_blur_stencil[i] = nil;
-        }
-    }
-    g_layer_count = count;
-    memcpy(g_layer_global, global, sizeof(int)*count);
-    g_composite_count = opCount;
-    memcpy(g_composite, ops, sizeof(int)*4*opCount);
-}
 
 static NSString *const kShaderSrc = @
     "#include <metal_stdlib>\n"
@@ -750,551 +710,151 @@ static void mg_resize(int winW, int winH) {
     [g_window setContentSize:NSMakeSize(winW, winH)];
 }
 
-// Background colour the base layer clears to on its first activation per
-// frame. Stashed by mg_frame_begin and consumed by mg_select_layer when it
-// opens the encoder for layer 0.
-static float g_clear_r = 0, g_clear_g = 0, g_clear_b = 0, g_clear_a = 1;
+// Resource operations deliberately do not cache targets, choose passes or
+// remember layer visits. The PureScript render closure owns those decisions.
+static void *mg_retain(id value) { return (__bridge_retained void *)value; }
+static void mg_release(void *value) {
+    if (value != NULL) { id released = (__bridge_transfer id)value; (void)released; }
+}
 
-static void mg_ensure_layer_textures(NSUInteger pxW, NSUInteger pxH) {
-    BOOL needRealloc = (g_layer_msaa[0] == nil
-                        || g_layer_msaa[0].width != pxW
-                        || g_layer_msaa[0].height != pxH);
-    if (!needRealloc) return;
-    for (int i = 0; i < MG_LAYER_COUNT; i++) {
-        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                                                                       width:pxW
-                                                                                      height:pxH
-                                                                                   mipmapped:NO];
+static MgTarget mg_target_create(int width, int height, int multisample) {
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+        width:width height:height mipmapped:NO];
+    td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    td.storageMode = MTLStorageModePrivate;
+    id<MTLTexture> resolve = [g_device newTextureWithDescriptor:td];
+    id<MTLTexture> color = resolve;
+    id<MTLTexture> stencil = nil;
+    if (multisample) {
         if (mg_multisampling_enabled()) {
             td.textureType = MTLTextureType2DMultisample;
             td.sampleCount = g_sample_count;
-            td.usage       = MTLTextureUsageRenderTarget;
-        } else {
-            td.usage       = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+            td.usage = MTLTextureUsageRenderTarget;
+            color = [g_device newTextureWithDescriptor:td];
         }
-        td.storageMode = MTLStorageModePrivate;
-        g_layer_msaa[i] = [g_device newTextureWithDescriptor:td];
-
-        if (mg_multisampling_enabled()) {
-            MTLTextureDescriptor *tr = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                                                                           width:pxW
-                                                                                          height:pxH
-                                                                                       mipmapped:NO];
-            tr.usage       = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-            tr.storageMode = MTLStorageModePrivate;
-            g_layer_resolve[i] = [g_device newTextureWithDescriptor:tr];
-        } else {
-            g_layer_resolve[i] = g_layer_msaa[i];
-        }
-
-        MTLTextureDescriptor *ts = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:g_stencil_fmt
-                                                                                       width:pxW
-                                                                                      height:pxH
-                                                                                   mipmapped:NO];
-        if (mg_multisampling_enabled()) {
-            ts.textureType = MTLTextureType2DMultisample;
-            ts.sampleCount = g_sample_count;
-        }
-        ts.usage       = MTLTextureUsageRenderTarget;
-        ts.storageMode = MTLStorageModePrivate;
-        g_layer_stencil[i] = [g_device newTextureWithDescriptor:ts];
+        td.pixelFormat = g_stencil_fmt;
+        td.usage = MTLTextureUsageRenderTarget;
+        stencil = [g_device newTextureWithDescriptor:td];
     }
+    return (MgTarget){mg_retain(color), mg_retain(resolve), mg_retain(stencil)};
 }
-
-// Reopening a layer preserves color and clears stencil; the Go renderer
-// reinstalls active clip entries on every layer transition.
-static int mg_select_layer(int t) {
-    if (t < 0 || t >= MG_LAYER_COUNT || g_frame_cb == nil) return 0;
-    if (t == g_current_layer) return 0;
-    if (g_frame_enc != nil) {
-        [g_frame_enc endEncoding];
-        g_frame_enc = nil;
-    }
-    // During a depth-of-field capture every layer routes to the parallel
-    // blur target set; the capture composites against transparent (the real
-    // backdrop is already on the main base) so base never takes the clear
-    // colour here.
-    BOOL capturing = g_blur_capture && !g_layer_global[t];
-    id<MTLTexture> __strong *msaa    = capturing ? g_blur_msaa    : g_layer_msaa;
-    id<MTLTexture> __strong *resolve = capturing ? g_blur_resolve : g_layer_resolve;
-    id<MTLTexture> __strong *stencil = capturing ? g_blur_stencil : g_layer_stencil;
-    BOOL           *visited = capturing ? g_blur_visited : g_layer_visited;
-
-    MTLRenderPassDescriptor *desc = [MTLRenderPassDescriptor renderPassDescriptor];
-    mg_configure_resolved_color(desc.colorAttachments[0],
-                                msaa[t],
-                                resolve[t],
-                                MTLStoreActionStoreAndMultisampleResolve);
-    if (!visited[t]) {
-        desc.colorAttachments[0].loadAction = MTLLoadActionClear;
-        if (t == 0 && !capturing) {
-            desc.colorAttachments[0].clearColor =
-                MTLClearColorMake(g_clear_r*g_clear_a, g_clear_g*g_clear_a,
-                                  g_clear_b*g_clear_a, g_clear_a);
-        } else {
-            desc.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
-        }
-        visited[t] = YES;
-    } else {
-        desc.colorAttachments[0].loadAction = MTLLoadActionLoad;
-    }
-    desc.stencilAttachment.texture      = stencil[t];
-    desc.stencilAttachment.loadAction   = MTLLoadActionClear;
-    desc.stencilAttachment.storeAction  = MTLStoreActionDontCare;
-    desc.stencilAttachment.clearStencil = 0;
-
-    g_frame_enc = [g_frame_cb renderCommandEncoderWithDescriptor:desc];
-    [g_frame_enc setRenderPipelineState:g_pso];
-    [g_frame_enc setDepthStencilState:g_dss_none];
-    g_current_layer = t;
-    // Don't reset g_vbuf_off / g_tbuf_off between passes: all passes in
-    // the same command buffer share the buffer, and Metal defers reads
-    // until commit. Rewinding here would let a later pass overwrite the
-    // bytes an earlier pass already referenced, producing garbage geometry.
-    return 1;
+static void mg_target_release(MgTarget target) {
+    mg_release(target.color); mg_release(target.resolve); mg_release(target.stencil);
 }
-
-static void mg_ensure_blur_textures(NSUInteger pxW, NSUInteger pxH) {
-    BOOL needRealloc = (g_blur_msaa[0] == nil
-                        || g_blur_msaa[0].width != pxW
-                        || g_blur_msaa[0].height != pxH);
-    if (!needRealloc) return;
-    for (int i = 0; i < MG_LAYER_COUNT; i++) {
-        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                                                                       width:pxW
-                                                                                      height:pxH
-                                                                                   mipmapped:NO];
-        if (mg_multisampling_enabled()) {
-            td.textureType = MTLTextureType2DMultisample;
-            td.sampleCount = g_sample_count;
-            td.usage       = MTLTextureUsageRenderTarget;
-        } else {
-            td.usage       = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-        }
-        td.storageMode = MTLStorageModePrivate;
-        g_blur_msaa[i] = [g_device newTextureWithDescriptor:td];
-
-        if (mg_multisampling_enabled()) {
-            MTLTextureDescriptor *tr = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                                                                           width:pxW
-                                                                                          height:pxH
-                                                                                       mipmapped:NO];
-            tr.usage       = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-            tr.storageMode = MTLStorageModePrivate;
-            g_blur_resolve[i] = [g_device newTextureWithDescriptor:tr];
-        } else {
-            g_blur_resolve[i] = g_blur_msaa[i];
-        }
-
-        MTLTextureDescriptor *ts = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:g_stencil_fmt
-                                                                                       width:pxW
-                                                                                      height:pxH
-                                                                                   mipmapped:NO];
-        if (mg_multisampling_enabled()) {
-            ts.textureType = MTLTextureType2DMultisample;
-            ts.sampleCount = g_sample_count;
-        }
-        ts.usage       = MTLTextureUsageRenderTarget;
-        ts.storageMode = MTLStorageModePrivate;
-        g_blur_stencil[i] = [g_device newTextureWithDescriptor:ts];
-    }
-    MTLTextureDescriptor *tsc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                                                                   width:pxW
-                                                                                  height:pxH
-                                                                               mipmapped:NO];
-    tsc.usage       = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-    tsc.storageMode = MTLStorageModePrivate;
-    g_blur_scratchA = [g_device newTextureWithDescriptor:tsc];
-    g_blur_scratchB = [g_device newTextureWithDescriptor:tsc];
+static void mg_encoder_end(void) {
+    if (g_frame_enc != nil) { [g_frame_enc endEncoding]; g_frame_enc = nil; }
 }
-
-// mg_blur_begin redirects all subsequent draws into the capture target set.
-static void mg_blur_begin(void) {
-    if (g_frame_cb == nil || g_blur_capture) return;
-    CGSize ds = g_layer.drawableSize;
-    if (ds.width <= 0 || ds.height <= 0) return;
-    mg_ensure_blur_textures((NSUInteger)ds.width, (NSUInteger)ds.height);
-    for (int i = 0; i < MG_LAYER_COUNT; i++) g_blur_visited[i] = NO;
-    g_blur_prev_layer = (g_current_layer < 0) ? 0 : g_current_layer;
-    g_blur_capture = YES;
-    g_current_layer = -1;
-    mg_select_layer(g_blur_prev_layer);
-}
-
-// Fullscreen pass helper: draw `pso` into `dst` sampling `src`, with the
-// 16-byte fragment uniform `p` (ignored by f_blit).
-static void mg_fullscreen_pass(id<MTLRenderPipelineState> pso,
-                               id<MTLTexture> dst, id<MTLTexture> src,
-                               const float *p) {
+static void mg_pass_begin(MgTarget target, int clear, const float *color) {
+    mg_encoder_end();
     MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
-    d.colorAttachments[0].texture     = dst;
-    d.colorAttachments[0].loadAction  = MTLLoadActionClear;
+    mg_configure_resolved_color(d.colorAttachments[0], (__bridge id)target.color,
+        (__bridge id)target.resolve, MTLStoreActionStoreAndMultisampleResolve);
+    d.colorAttachments[0].loadAction = clear ? MTLLoadActionClear : MTLLoadActionLoad;
+    d.colorAttachments[0].clearColor = MTLClearColorMake(color[0], color[1], color[2], color[3]);
+    d.stencilAttachment.texture = (__bridge id)target.stencil;
+    d.stencilAttachment.loadAction = MTLLoadActionClear;
+    d.stencilAttachment.storeAction = MTLStoreActionDontCare;
+    g_frame_enc = [g_frame_cb renderCommandEncoderWithDescriptor:d];
+    [g_frame_enc setDepthStencilState:g_dss_none];
+}
+static void mg_compose(const MgTarget *sources, int count, const int *ops, int opCount, MgTarget destination, int drawable) {
+    mg_encoder_end();
+    MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
+    d.colorAttachments[0].texture = drawable ? g_frame_drawable.texture : (__bridge id)destination.resolve;
+    d.colorAttachments[0].loadAction = MTLLoadActionClear;
     d.colorAttachments[0].storeAction = MTLStoreActionStore;
-    d.colorAttachments[0].clearColor  = MTLClearColorMake(0, 0, 0, 0);
     id<MTLRenderCommandEncoder> e = [g_frame_cb renderCommandEncoderWithDescriptor:d];
-    [e setRenderPipelineState:pso];
-    [e setFragmentTexture:src atIndex:0];
+    [e setRenderPipelineState:g_pso_compose];
+    for (int i=0; i<31; i++) [e setFragmentTexture:(__bridge id)sources[i<count ? i : 0].resolve atIndex:i];
     [e setFragmentSamplerState:g_sampler atIndex:0];
-    if (p != NULL) [e setFragmentBytes:p length:16 atIndex:0];
+    [e setFragmentBytes:ops length:sizeof(int)*4*opCount atIndex:0];
+    [e setFragmentBytes:&opCount length:sizeof(int) atIndex:1];
     [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [e endEncoding];
 }
-
-// mg_blur_end composes the captured layers, gaussian-blurs the composite by
-// `sigma_pts` (view points; converted to pixels here), source-overs it onto
-// the layer that was active at mg_blur_begin, and reopens that layer for
-// the remaining draws.
-static void mg_blur_end(float sigma_pts) {
-    if (g_frame_cb == nil || !g_blur_capture) return;
-    if (g_frame_enc != nil) {
-        [g_frame_enc endEncoding];
-        g_frame_enc = nil;
-    }
-    // Untouched capture layers still need defined contents for the compose.
-    for (int i = 0; i < MG_LAYER_COUNT; i++) {
-        if (g_blur_visited[i]) continue;
-        MTLRenderPassDescriptor *cd = [MTLRenderPassDescriptor renderPassDescriptor];
-        mg_configure_resolved_color(cd.colorAttachments[0],
-                                    g_blur_msaa[i],
-                                    g_blur_resolve[i],
-                                    MTLStoreActionMultisampleResolve);
-        cd.colorAttachments[0].loadAction     = MTLLoadActionClear;
-        cd.colorAttachments[0].clearColor     = MTLClearColorMake(0, 0, 0, 0);
-        id<MTLRenderCommandEncoder> e = [g_frame_cb renderCommandEncoderWithDescriptor:cd];
-        [e endEncoding];
-        g_blur_visited[i] = YES;
-    }
-
-    // Compose the captured group with the same caller-supplied recipe.
-    MTLRenderPassDescriptor *desc = [MTLRenderPassDescriptor renderPassDescriptor];
-    desc.colorAttachments[0].texture     = g_blur_scratchA;
-    desc.colorAttachments[0].loadAction  = MTLLoadActionClear;
-    desc.colorAttachments[0].storeAction = MTLStoreActionStore;
-    desc.colorAttachments[0].clearColor  = MTLClearColorMake(0, 0, 0, 0);
-    id<MTLRenderCommandEncoder> ce = [g_frame_cb renderCommandEncoderWithDescriptor:desc];
-    [ce setRenderPipelineState:g_pso_compose];
-    for (int i = 0; i < MG_MAX_LAYERS; i++) {
-        [ce setFragmentTexture:g_blur_resolve[i < MG_LAYER_COUNT ? i : 0] atIndex:i];
-    }
-    [ce setFragmentSamplerState:g_sampler atIndex:0];
-    [ce setFragmentBytes:g_composite length:sizeof(int)*4*g_composite_count atIndex:0];
-    [ce setFragmentBytes:&g_composite_count length:sizeof(int) atIndex:1];
-    [ce drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
-    [ce endEncoding];
-
-    CGFloat scale = g_layer.contentsScale > 0 ? g_layer.contentsScale : 1.0;
-    float sigma_px = sigma_pts * (float)scale;
-    float w = (float)g_blur_scratchA.width;
-    float h = (float)g_blur_scratchA.height;
-    id<MTLTexture> result = g_blur_scratchA;
-    if (sigma_px >= 0.25f && w > 0 && h > 0) {
-        float ph[4] = { 1.0f / w, 0.0f, sigma_px, 0.0f };
-        mg_fullscreen_pass(g_pso_gauss, g_blur_scratchB, g_blur_scratchA, ph);
-        float pv[4] = { 0.0f, 1.0f / h, sigma_px, 0.0f };
-        mg_fullscreen_pass(g_pso_gauss, g_blur_scratchA, g_blur_scratchB, pv);
-    }
-
-    // Source-over the blurred composite onto the original layer target; the
-    // pass loads the existing content (clearing only if this is somehow the
-    // layer's first touch) and resolves when the active GPU path uses MSAA.
-    g_blur_capture = NO;
-    int t = g_blur_prev_layer;
-    MTLRenderPassDescriptor *bd = [MTLRenderPassDescriptor renderPassDescriptor];
-    mg_configure_resolved_color(bd.colorAttachments[0],
-                                g_layer_msaa[t],
-                                g_layer_resolve[t],
-                                MTLStoreActionStoreAndMultisampleResolve);
-    if (!g_layer_visited[t]) {
-        bd.colorAttachments[0].loadAction = MTLLoadActionClear;
-        bd.colorAttachments[0].clearColor = (t == 0)
-            ? MTLClearColorMake(g_clear_r*g_clear_a, g_clear_g*g_clear_a,
-                                g_clear_b*g_clear_a, g_clear_a)
-            : MTLClearColorMake(0, 0, 0, 0);
-        g_layer_visited[t] = YES;
-    } else {
-        bd.colorAttachments[0].loadAction = MTLLoadActionLoad;
-    }
-    bd.stencilAttachment.texture      = g_layer_stencil[t];
-    bd.stencilAttachment.loadAction   = MTLLoadActionClear;
-    bd.stencilAttachment.storeAction  = MTLStoreActionDontCare;
-    bd.stencilAttachment.clearStencil = 0;
-    id<MTLRenderCommandEncoder> be = [g_frame_cb renderCommandEncoderWithDescriptor:bd];
-    [be setRenderPipelineState:g_pso_blit];
-    [be setFragmentTexture:result atIndex:0];
-    [be setFragmentSamplerState:g_sampler atIndex:0];
-    [be drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
-    [be endEncoding];
-
-    // Reopen the layer for whatever the frame draws next.
-    g_current_layer = -1;
-    mg_select_layer(t);
+static void mg_filter(MgTarget source, MgTarget destination, const float *uniform) {
+    mg_encoder_end();
+    MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
+    d.colorAttachments[0].texture = (__bridge id)destination.resolve;
+    d.colorAttachments[0].loadAction = MTLLoadActionClear;
+    d.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> e = [g_frame_cb renderCommandEncoderWithDescriptor:d];
+    [e setRenderPipelineState:g_pso_gauss];
+    [e setFragmentTexture:(__bridge id)source.resolve atIndex:0];
+    [e setFragmentSamplerState:g_sampler atIndex:0];
+    [e setFragmentBytes:uniform length:16 atIndex:0];
+    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [e endEncoding];
 }
-
-static int mg_frame_begin(float r, float g, float b, float a) {
+static void mg_blit(MgTarget source) {
+    [g_frame_enc setRenderPipelineState:g_pso_blit];
+    [g_frame_enc setFragmentTexture:(__bridge id)source.resolve atIndex:0];
+    [g_frame_enc setFragmentSamplerState:g_sampler atIndex:0];
+    [g_frame_enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+}
+static int mg_frame_begin(void) {
     if (g_layer == nil) return 0;
-    // Track the current view bounds — without this the metal layer keeps
-    // the drawable size set at mg_setup, so the rendered content stretches
-    // (or letterboxes wrong) once the user resizes the window. We resize
-    // the drawable here; the per-frame SetViewport op already letterboxes
-    // the scene into whatever drawable size it finds.
-    if (g_window != nil && g_view != nil) {
-        CGFloat scale = [g_window backingScaleFactor];
-        if (scale <= 0) scale = 1.0;
-        // Use the window's contentView bounds — that view always tracks the
-        // window size. g_view may live inside an NSGlassEffectView's
-        // contentView slot (set via KVC), which doesn't auto-resize its child
-        // the way NSWindow does, so [g_view bounds] would stay frozen at the
-        // initial size.
-        NSSize wbs = [[g_window contentView] bounds].size;
-        if (!NSEqualRects([g_view frame], NSMakeRect(0, 0, wbs.width, wbs.height))) {
-            [g_view setFrame:NSMakeRect(0, 0, wbs.width, wbs.height)];
-        }
-        CGSize want = CGSizeMake(wbs.width * scale, wbs.height * scale);
-        if (want.width > 0 && want.height > 0 &&
-            (want.width != g_layer.drawableSize.width ||
-             want.height != g_layer.drawableSize.height)) {
-            g_layer.drawableSize  = want;
-            g_layer.contentsScale = scale;
-        }
-    }
-    CGSize ds = g_layer.drawableSize;
-    if (ds.width <= 0 || ds.height <= 0) return 0;
-    CGFloat scale = g_layer.contentsScale > 0 ? g_layer.contentsScale : 1.0;
-    g_vp_w = (float)(ds.width / scale);
-    g_vp_h = (float)(ds.height / scale);
-
+    CGFloat scale = [g_window backingScaleFactor];
+    if (scale <= 0) scale = 1;
+    NSSize bounds = [[g_window contentView] bounds].size;
+    if (bounds.width <= 0 || bounds.height <= 0) return 0;
+    [g_view setFrame:NSMakeRect(0, 0, bounds.width, bounds.height)];
+    g_layer.drawableSize = CGSizeMake(bounds.width*scale, bounds.height*scale);
+    g_layer.contentsScale = scale;
+    g_vp_w = bounds.width; g_vp_h = bounds.height;
     g_frame_drawable = [g_layer nextDrawable];
     if (g_frame_drawable == nil) return 0;
-
-    mg_ensure_layer_textures((NSUInteger)ds.width, (NSUInteger)ds.height);
-    for (int i = 0; i < MG_LAYER_COUNT; i++) g_layer_visited[i] = NO;
-    g_current_layer = -1;
-    g_clear_r = r; g_clear_g = g; g_clear_b = b; g_clear_a = a;
-
     g_frame_cb = [g_queue commandBuffer];
-    g_vbuf_off = 0;
-    g_tbuf_off = 0;
-    // Pre-warm base so callers that draw before any pushLayer have a target.
-    mg_select_layer(0);
     return 1;
 }
-
-// Grow the buffer to at least `need` bytes total capacity, copying any
-// already-written data (offset 0..used) into the new allocation so commands
-// already encoded against the old buffer keep referencing valid data — Metal
-// retains the old buffer until the command buffer completes, but if we're
-// using the SAME global pointer for future draws within the same encode pass
-// we must hand them the new buffer; the old draws still reference the old one.
-static id<MTLBuffer> mg_ensure_buf(id<MTLBuffer> buf, NSUInteger *cap, NSUInteger used, NSUInteger need) {
-    if (buf != nil && *cap >= need) return buf;
-    NSUInteger newCap = (*cap < 4096) ? 4096 : *cap;
-    while (newCap < need) newCap *= 2;
-    id<MTLBuffer> nb = [g_device newBufferWithLength:newCap options:MTLResourceStorageModeShared];
-    if (buf != nil && used > 0) {
-        memcpy([nb contents], [buf contents], used);
-    }
-    *cap = newCap;
-    return nb;
-}
-
-static void mg_atlas_upload(int x, int y, int w, int h, const unsigned char *bytes) {
-    if (w <= 0 || h <= 0) return;
-    if (g_atlas == nil || g_atlas.width != (NSUInteger)w || g_atlas.height != (NSUInteger)h) {
-        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
-                                                                                   width:w height:h mipmapped:NO];
-        td.usage = MTLTextureUsageShaderRead;
-        td.storageMode = MTLStorageModeShared;
-        g_atlas = [g_device newTextureWithDescriptor:td];
-    }
-    MTLRegion region = MTLRegionMake2D((NSUInteger)x, (NSUInteger)y, (NSUInteger)w, (NSUInteger)h);
-    [g_atlas replaceRegion:region mipmapLevel:0 withBytes:bytes bytesPerRow:(NSUInteger)(w * 4)];
-}
-
-// Align to 16 bytes (safe for any vertex stride we use).
-static inline NSUInteger mg_align16(NSUInteger n) { return (n + 15u) & ~(NSUInteger)15u; }
-
-static void mg_draw_rrect(const float *verts, int count) {
-    if (g_frame_enc == nil || count <= 0) return;
-    NSUInteger bytes = (NSUInteger)count * 52;
-    NSUInteger off   = g_tbuf_off;
-    NSUInteger need  = off + bytes;
-    g_tbuf = mg_ensure_buf(g_tbuf, &g_tbuf_cap, off, need);
-    memcpy((char *)[g_tbuf contents] + off, verts, bytes);
-    g_tbuf_off = mg_align16(need);
-    float vp[2] = { g_vp_w, g_vp_h };
-    [g_frame_enc setRenderPipelineState:g_pso_rrect];
-    [g_frame_enc setVertexBuffer:g_tbuf offset:off atIndex:0];
-    [g_frame_enc setVertexBytes:vp length:sizeof(vp) atIndex:1];
-    [g_frame_enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:count];
-    [g_frame_enc setRenderPipelineState:g_pso];
-}
-
-// uni layout: [tile, dotR, 0, 0,  bg.rgba,  dot.rgba]  (12 floats, 48 bytes)
-static void mg_draw_pattern(const float *verts, int count, const float *uni, int lattice) {
-    if (g_frame_enc == nil || count <= 0) return;
-    NSUInteger bytes = (NSUInteger)count * 16;
-    NSUInteger off   = g_tbuf_off;
-    NSUInteger need  = off + bytes;
-    g_tbuf = mg_ensure_buf(g_tbuf, &g_tbuf_cap, off, need);
-    memcpy((char *)[g_tbuf contents] + off, verts, bytes);
-    g_tbuf_off = mg_align16(need);
-    float vp[2] = { g_vp_w, g_vp_h };
-    [g_frame_enc setRenderPipelineState:lattice ? g_pso_lattice : g_pso_bgdots];
-    [g_frame_enc setVertexBuffer:g_tbuf offset:off atIndex:0];
-    [g_frame_enc setVertexBytes:vp length:sizeof(vp) atIndex:1];
-    [g_frame_enc setFragmentBytes:uni length:lattice ? 64 : 48 atIndex:0];
-    [g_frame_enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:count];
-    [g_frame_enc setRenderPipelineState:g_pso];
-}
-
-static void mg_draw_msdf(const float *verts, int count, float screenPxRange) {
-    if (g_frame_enc == nil || count <= 0) return;
-    NSUInteger bytes = (NSUInteger)count * 32;
-    NSUInteger off   = g_tbuf_off;
-    NSUInteger need  = off + bytes;
-    g_tbuf = mg_ensure_buf(g_tbuf, &g_tbuf_cap, off, need);
-    memcpy((char *)[g_tbuf contents] + off, verts, bytes);
-    g_tbuf_off = mg_align16(need);
-    float vp[2] = { g_vp_w, g_vp_h };
-    [g_frame_enc setRenderPipelineState:g_pso_msdf];
-    [g_frame_enc setVertexBuffer:g_tbuf offset:off atIndex:0];
-    [g_frame_enc setVertexBytes:vp length:sizeof(vp) atIndex:1];
-    [g_frame_enc setFragmentTexture:g_atlas atIndex:0];
-    [g_frame_enc setFragmentSamplerState:g_sampler atIndex:0];
-    [g_frame_enc setFragmentBytes:&screenPxRange length:sizeof(float) atIndex:0];
-    [g_frame_enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:count];
-    [g_frame_enc setRenderPipelineState:g_pso];
-}
-
-static void mg_draw_triangles(const float *verts, int count) {
-    if (g_frame_enc == nil || count <= 0) return;
-    NSUInteger bytes = (NSUInteger)count * 24;
-    NSUInteger off   = g_vbuf_off;
-    NSUInteger need  = off + bytes;
-    g_vbuf = mg_ensure_buf(g_vbuf, &g_vbuf_cap, off, need);
-    memcpy((char *)[g_vbuf contents] + off, verts, bytes);
-    g_vbuf_off = mg_align16(need);
-    float vp[2] = { g_vp_w, g_vp_h };
-    [g_frame_enc setVertexBuffer:g_vbuf offset:off atIndex:0];
-    [g_frame_enc setVertexBytes:vp length:sizeof(vp) atIndex:1];
-    [g_frame_enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:count];
-}
-
-static void mg_draw_triangles_diff(const float *verts, int count) {
-    if (g_frame_enc == nil || count <= 0) return;
-    NSUInteger bytes = (NSUInteger)count * 24;
-    NSUInteger off   = g_vbuf_off;
-    NSUInteger need  = off + bytes;
-    g_vbuf = mg_ensure_buf(g_vbuf, &g_vbuf_cap, off, need);
-    memcpy((char *)[g_vbuf contents] + off, verts, bytes);
-    g_vbuf_off = mg_align16(need);
-    float vp[2] = { g_vp_w, g_vp_h };
-    [g_frame_enc setRenderPipelineState:g_pso_diff];
-    [g_frame_enc setVertexBuffer:g_vbuf offset:off atIndex:0];
-    [g_frame_enc setVertexBytes:vp length:sizeof(vp) atIndex:1];
-    [g_frame_enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:count];
-    [g_frame_enc setRenderPipelineState:g_pso];
-}
-
-// Clip modes: set a non-zero contour, toggle one even-odd contour, or clear a
-// non-zero contour while popping. The depth selects the dedicated stencil bit.
-static void mg_draw_clip(const float *verts, int count, int depth, int mode) {
-    if (g_frame_enc == nil || count <= 0 || depth < 1 || depth > MG_CLIP_DEPTH) return;
-    NSUInteger bytes = (NSUInteger)count * 24;
-    NSUInteger off   = g_vbuf_off;
-    NSUInteger need  = off + bytes;
-    g_vbuf = mg_ensure_buf(g_vbuf, &g_vbuf_cap, off, need);
-    memcpy((char *)[g_vbuf contents] + off, verts, bytes);
-    g_vbuf_off = mg_align16(need);
-    float vp[2] = { g_vp_w, g_vp_h };
-    uint32_t bit = 1u << (depth - 1);
-    uint32_t activeMask = (bit << 1u) - 1u;
-    uint32_t parentMask = bit - 1u;
-    id<MTLDepthStencilState> state = g_dss_clip_set[depth-1];
-    uint32_t reference = activeMask;
-    if (mode == 1) {
-        state = g_dss_clip_toggle[depth-1];
-        reference = parentMask;
-    } else if (mode == 2) {
-        state = g_dss_clip_clear[depth-1];
-    }
-    [g_frame_enc setRenderPipelineState:g_pso_clip];
-    [g_frame_enc setDepthStencilState:state];
-    [g_frame_enc setStencilReferenceValue:reference];
-    [g_frame_enc setVertexBuffer:g_vbuf offset:off atIndex:0];
-    [g_frame_enc setVertexBytes:vp length:sizeof(vp) atIndex:1];
-    [g_frame_enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:count];
-    [g_frame_enc setRenderPipelineState:g_pso];
-}
-
-static void mg_set_clip_depth(int depth) {
-    if (g_frame_enc == nil) return;
-    if (depth <= 0) {
-        [g_frame_enc setDepthStencilState:g_dss_none];
-        return;
-    }
-    if (depth > MG_CLIP_DEPTH) {
-        [g_frame_enc setDepthStencilState:g_dss_clip_fail];
-        [g_frame_enc setStencilReferenceValue:0];
-        return;
-    }
-    uint32_t activeMask = (1u << depth) - 1u;
-    [g_frame_enc setDepthStencilState:g_dss_clip_test[depth-1]];
-    [g_frame_enc setStencilReferenceValue:activeMask];
-}
-
-static int mg_clip_depth_limit(void) { return MG_CLIP_DEPTH; }
-
 static void mg_frame_end(void) {
-    if (g_frame_cb == nil) return;
-    if (g_frame_enc != nil) {
-        [g_frame_enc endEncoding];
-        g_frame_enc = nil;
-    }
-    // Clear unvisited targets before sampling them in the composition pass.
-    for (int i = 0; i < MG_LAYER_COUNT; i++) {
-        if (g_layer_visited[i]) continue;
-        MTLRenderPassDescriptor *cd = [MTLRenderPassDescriptor renderPassDescriptor];
-        mg_configure_resolved_color(cd.colorAttachments[0],
-                                    g_layer_msaa[i],
-                                    g_layer_resolve[i],
-                                    MTLStoreActionMultisampleResolve);
-        cd.colorAttachments[0].loadAction     = MTLLoadActionClear;
-        cd.colorAttachments[0].clearColor     = (i == 0)
-            ? MTLClearColorMake(g_clear_r*g_clear_a, g_clear_g*g_clear_a,
-                                g_clear_b*g_clear_a, g_clear_a)
-            : MTLClearColorMake(0, 0, 0, 0);
-        id<MTLRenderCommandEncoder> e = [g_frame_cb renderCommandEncoderWithDescriptor:cd];
-        [e endEncoding];
-        g_layer_visited[i] = YES;
-    }
-    MTLRenderPassDescriptor *desc = [MTLRenderPassDescriptor renderPassDescriptor];
-    desc.colorAttachments[0].texture     = g_frame_drawable.texture;
-    desc.colorAttachments[0].loadAction  = MTLLoadActionClear;
-    desc.colorAttachments[0].storeAction = MTLStoreActionStore;
-    desc.colorAttachments[0].clearColor  = MTLClearColorMake(0, 0, 0, 0);
-    id<MTLRenderCommandEncoder> ce = [g_frame_cb renderCommandEncoderWithDescriptor:desc];
-    [ce setRenderPipelineState:g_pso_compose];
-    for (int i = 0; i < MG_MAX_LAYERS; i++) {
-        [ce setFragmentTexture:g_layer_resolve[i < MG_LAYER_COUNT ? i : 0] atIndex:i];
-    }
-    [ce setFragmentSamplerState:g_sampler atIndex:0];
-    [ce setFragmentBytes:g_composite length:sizeof(int)*4*g_composite_count atIndex:0];
-    [ce setFragmentBytes:&g_composite_count length:sizeof(int) atIndex:1];
-    [ce drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
-    [ce endEncoding];
-
+    mg_encoder_end();
     [g_frame_cb presentDrawable:g_frame_drawable];
     [g_frame_cb commit];
-    // Reused shared vertex buffers cannot be overwritten while the GPU reads.
     [g_frame_cb waitUntilCompleted];
-    g_frame_cb = nil; g_frame_drawable = nil; g_current_layer = -1;
+    g_frame_cb = nil; g_frame_drawable = nil;
+}
+static void *mg_buffer_create(int capacity) {
+    return mg_retain([g_device newBufferWithLength:capacity options:MTLResourceStorageModeShared]);
+}
+static void mg_draw(void *buffer, int offset, const float *vertices, int floats,
+                    int pipeline, int stride, const float *uniform, int uniformCount) {
+    id<MTLBuffer> b = (__bridge id)buffer;
+    memcpy((char *)[b contents]+offset, vertices, sizeof(float)*floats);
+    id<MTLRenderPipelineState> states[] = {g_pso, g_pso_diff, g_pso_rrect, g_pso_bgdots, g_pso_lattice, g_pso_msdf, g_pso_clip};
+    [g_frame_enc setRenderPipelineState:states[pipeline]];
+    [g_frame_enc setVertexBuffer:b offset:offset atIndex:0];
+    float vp[] = {g_vp_w, g_vp_h};
+    [g_frame_enc setVertexBytes:vp length:sizeof(vp) atIndex:1];
+    if (uniformCount > 0) [g_frame_enc setFragmentBytes:uniform length:sizeof(float)*uniformCount atIndex:0];
+    if (pipeline == 5) {
+        [g_frame_enc setFragmentTexture:g_atlas atIndex:0];
+        [g_frame_enc setFragmentSamplerState:g_sampler atIndex:0];
+    }
+    [g_frame_enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:floats/stride];
+}
+static void mg_stencil(int state, int depth, int reference) {
+    id<MTLDepthStencilState> value = g_dss_none;
+    if (state == 1) value = g_dss_clip_fail;
+    if (state == 2) value = g_dss_clip_set[depth-1];
+    if (state == 3) value = g_dss_clip_toggle[depth-1];
+    if (state == 4) value = g_dss_clip_clear[depth-1];
+    if (state == 5) value = g_dss_clip_test[depth-1];
+    [g_frame_enc setDepthStencilState:value];
+    [g_frame_enc setStencilReferenceValue:reference];
+}
+static void mg_atlas_upload(int x, int y, int w, int h, const unsigned char *bytes) {
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+        width:w height:h mipmapped:NO];
+    td.usage = MTLTextureUsageShaderRead;
+    td.storageMode = MTLStorageModeShared;
+    g_atlas = [g_device newTextureWithDescriptor:td];
+    [g_atlas replaceRegion:MTLRegionMake2D(x,y,w,h) mipmapLevel:0 withBytes:bytes bytesPerRow:w*4];
 }
 
 static void mg_start_tick(int fps) {
     mg_stop_tick();
     mg_quit_requested = 0;
-    if (fps <= 0) fps = 60;
     g_tickTarget = [[MgTickTarget alloc] init];
     g_tickTimer = [NSTimer timerWithTimeInterval:(1.0/(double)fps)
                                           target:g_tickTarget
@@ -1319,12 +879,7 @@ static void mg_run(void) {
     [NSApp setDelegate:nil];
     g_window = nil; g_view = nil; g_noDragView = nil; g_layer = nil;
     g_winDelegate = nil; g_appDelegate = nil;
-    for (int i=0; i<MG_MAX_LAYERS; ++i) {
-        g_layer_msaa[i] = nil; g_layer_resolve[i] = nil; g_layer_stencil[i] = nil;
-        g_blur_msaa[i] = nil; g_blur_resolve[i] = nil; g_blur_stencil[i] = nil;
-    }
-    g_blur_scratchA = nil; g_blur_scratchB = nil; g_blur_capture = NO;
-    g_vbuf = nil; g_tbuf = nil; g_vbuf_cap = 0; g_tbuf_cap = 0;
+    // Render-closure-owned buffers and targets are released by PureScript.
     g_atlas = nil; g_frame_cb = nil; g_frame_drawable = nil; g_frame_enc = nil;
     g_pso = nil; g_pso_diff = nil; g_pso_tex = nil; g_pso_msdf = nil;
     g_pso_rrect = nil; g_pso_bgdots = nil; g_pso_lattice = nil;
@@ -1341,49 +896,17 @@ static float mg_backing_scale(void) {
     if (g_window == nil) return 1.0f;
     return (float)[g_window backingScaleFactor];
 }
-static float mg_vp_width(void)  { return g_vp_w; }
-static float mg_vp_height(void) { return g_vp_h; }
+static float mg_vp_width(void) { return (float)[[g_window contentView] bounds].size.width; }
+static float mg_vp_height(void) { return (float)[[g_window contentView] bounds].size.height; }
 */
 import "C"
 
-import (
-	"fmt"
-	"unsafe"
-
-	"github.com/i-am-the-slime/purescript-native-graphics/drawing"
-)
-
-// Prepare selects the caller's target layout before FrameBegin allocates textures.
-// Metal's texture argument limit is 31; uniform bytes limit the recipe to 256 steps.
-func Prepare(frame *drawing.Drawing) error {
-	count := len(frame.Layers)
-	if count < 1 || count > 31 {
-		return fmt.Errorf("Metal requires 1..31 layers, got %d", count)
-	}
-	if len(frame.Composite) < 1 || len(frame.Composite) > 256 {
-		return fmt.Errorf("Metal requires 1..256 composition steps, got %d", len(frame.Composite))
-	}
-	var globals [31]C.int
-	var ops [256 * 4]C.int
-	for i, layer := range frame.Layers {
-		if layer.Global {
-			globals[i] = 1
-		}
-	}
-	for i, op := range frame.Composite {
-		if op.Source < 0 || op.Source >= count || op.Mask < -1 || op.Mask >= count || op.Blend < 0 || op.Blend > 1 {
-			return fmt.Errorf("invalid Metal composition step %d", i)
-		}
-		ops[i*4], ops[i*4+1], ops[i*4+3] = C.int(op.Source), C.int(op.Mask), C.int(op.Blend)
-		if op.InvertMask {
-			ops[i*4+2] = 1
-		}
-	}
-	C.mg_prepare(C.int(count), &globals[0], C.int(len(frame.Composite)), &ops[0])
-	return nil
-}
+import "unsafe"
 
 var tickFn func()
+var cleanupFn func()
+
+func SetCleanupFunc(f func()) { cleanupFn = f }
 
 //export goRenderTick
 func goRenderTick() {
@@ -1447,6 +970,10 @@ func Resize(winW, winH int) { C.mg_resize(C.int(winW), C.int(winH)) }
 func StartTick(fps int)     { C.mg_start_tick(C.int(fps)) }
 func Run() {
 	C.mg_run()
+	if cleanupFn != nil {
+		cleanupFn()
+		cleanupFn = nil
+	}
 	tickFn = nil
 }
 func BackingScale() float32 { return float32(C.mg_backing_scale()) }
@@ -1472,28 +999,72 @@ const (
 )
 
 // ViewportSize returns the current logical (point, not pixel) drawable size.
-// Updated each frame by mg_frame_begin from the window's contentView bounds.
+// Query live window bounds so the PureScript frame callback receives a resize immediately.
 func ViewportSize() (float32, float32) {
 	return float32(C.mg_vp_width()), float32(C.mg_vp_height())
 }
 
-func FrameBegin(r, g, b, a float32) bool {
-	return C.mg_frame_begin(C.float(r), C.float(g), C.float(b), C.float(a)) != 0
-}
-func FrameEnd() { C.mg_frame_end() }
+func FrameBegin() bool { return C.mg_frame_begin() != 0 }
+func FrameEnd()        { C.mg_frame_end() }
 
-func drawTriangles(verts []float32) {
-	if len(verts) == 0 {
+type Target struct{ native C.MgTarget }
+type Buffer struct{ native unsafe.Pointer }
+
+func NewTarget(width, height int, multisample bool) *Target {
+	target := &Target{C.mg_target_create(C.int(width), C.int(height), nativeFlag(multisample))}
+	if target.native.color == nil || target.native.resolve == nil || (multisample && target.native.stencil == nil) {
+		ReleaseTarget(target)
+		panic("Metal target allocation failed")
+	}
+	return target
+}
+func ReleaseTarget(target *Target) {
+	C.mg_target_release(target.native)
+	target.native = C.MgTarget{}
+}
+func NewBuffer(capacity int) *Buffer {
+	buffer := &Buffer{C.mg_buffer_create(C.int(capacity))}
+	if buffer.native == nil {
+		panic("Metal vertex buffer allocation failed")
+	}
+	return buffer
+}
+func ReleaseBuffer(buffer *Buffer) {
+	C.mg_release(buffer.native)
+	buffer.native = nil
+}
+func BeginPass(target *Target, clear bool, color []float32) {
+	C.mg_pass_begin(target.native, nativeFlag(clear), (*C.float)(unsafe.Pointer(&color[0])))
+}
+func EndPass() { C.mg_encoder_end() }
+func Compose(sources []*Target, ops []int32, destination *Target, drawable bool) {
+	targets := make([]C.MgTarget, len(sources))
+	for i, source := range sources {
+		targets[i] = source.native
+	}
+	var dst C.MgTarget
+	if destination != nil {
+		dst = destination.native
+	}
+	C.mg_compose(&targets[0], C.int(len(targets)), (*C.int)(unsafe.Pointer(&ops[0])), C.int(len(ops)/4), dst, nativeFlag(drawable))
+}
+func Filter(source, destination *Target, uniform []float32) {
+	C.mg_filter(source.native, destination.native, (*C.float)(unsafe.Pointer(&uniform[0])))
+}
+func Blit(source *Target) { C.mg_blit(source.native) }
+func Stencil(state, depth, reference int) {
+	C.mg_stencil(C.int(state), C.int(depth), C.int(reference))
+}
+func Draw(buffer *Buffer, offset int, vertices []float32, pipeline, stride int, uniform []float32) {
+	if len(vertices) == 0 {
 		return
 	}
-	C.mg_draw_triangles((*C.float)(unsafe.Pointer(&verts[0])), C.int(len(verts)/6))
-}
-
-func drawTrianglesDiff(verts []float32) {
-	if len(verts) == 0 {
-		return
+	var u *C.float
+	if len(uniform) > 0 {
+		u = (*C.float)(unsafe.Pointer(&uniform[0]))
 	}
-	C.mg_draw_triangles_diff((*C.float)(unsafe.Pointer(&verts[0])), C.int(len(verts)/6))
+	C.mg_draw(buffer.native, C.int(offset), (*C.float)(unsafe.Pointer(&vertices[0])), C.int(len(vertices)),
+		C.int(pipeline), C.int(stride), u, C.int(len(uniform)))
 }
 
 func atlasUpload(x, y, w, h int, bytes []byte) {
@@ -1502,63 +1073,4 @@ func atlasUpload(x, y, w, h int, bytes []byte) {
 	}
 	C.mg_atlas_upload(C.int(x), C.int(y), C.int(w), C.int(h),
 		(*C.uchar)(unsafe.Pointer(&bytes[0])))
-}
-
-func selectLayer(t int) bool { return C.mg_select_layer(C.int(t)) != 0 }
-
-func blurBegin()            { C.mg_blur_begin() }
-func blurEnd(sigma float32) { C.mg_blur_end(C.float(sigma)) }
-
-const (
-	clipModeSet = iota
-	clipModeToggle
-	clipModeClear
-)
-
-func drawClipPath(verts []float32, depth, mode int) {
-	if len(verts) == 0 {
-		return
-	}
-	C.mg_draw_clip(
-		(*C.float)(unsafe.Pointer(&verts[0])),
-		C.int(len(verts)/6),
-		C.int(depth),
-		C.int(mode),
-	)
-}
-
-func setClipDepth(depth int) {
-	C.mg_set_clip_depth(C.int(depth))
-}
-
-func clipDepthLimit() int {
-	return int(C.mg_clip_depth_limit())
-}
-
-func drawRRect(verts []float32) {
-	if len(verts) == 0 {
-		return
-	}
-	C.mg_draw_rrect((*C.float)(unsafe.Pointer(&verts[0])), C.int(len(verts)/13))
-}
-
-func drawBgDots(verts, uni []float32) {
-	if len(verts) == 0 {
-		return
-	}
-	C.mg_draw_pattern((*C.float)(unsafe.Pointer(&verts[0])), C.int(len(verts)/4), (*C.float)(unsafe.Pointer(&uni[0])), 0)
-}
-
-func drawLattice(verts, uni []float32) {
-	if len(verts) == 0 {
-		return
-	}
-	C.mg_draw_pattern((*C.float)(unsafe.Pointer(&verts[0])), C.int(len(verts)/4), (*C.float)(unsafe.Pointer(&uni[0])), 1)
-}
-
-func drawMSDF(verts []float32, screenPxRange float32) {
-	if len(verts) == 0 {
-		return
-	}
-	C.mg_draw_msdf((*C.float)(unsafe.Pointer(&verts[0])), C.int(len(verts)/8), C.float(screenPxRange))
 }

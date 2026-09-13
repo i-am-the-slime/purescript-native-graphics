@@ -9,6 +9,6 @@ import (
 
 func deviceScaleFactor() float64 { return 1 }
 func configureWindow(Dict) error { return nil }
-func runMetal(windowOptions, func(Dict) windowOutput) error {
+func runMetal(windowOptions, func(Dict) windowOutput, metalRenderer) error {
 	return fmt.Errorf("native graphics: Metal requires Darwin")
 }
