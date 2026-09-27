@@ -51,13 +51,6 @@ func init() {
 	g["writeByte"] = curry3(func(v, i, b Any) Any {
 		return func() Any { v.(*image.RGBA).Pix[integer(i)] = uint8(integer(b)); return nil }
 	})
-	g["newFloats"] = func(v Any) Any { return func() Any { return make([]float32, integer(v)) } }
-	g["readFloat"] = curry2(func(v, i Any) Any { return func() Any { return float64(v.([]float32)[integer(i)]) } })
-	g["writeFloat"] = curry3(func(v, i, b Any) Any {
-		return func() Any { v.([]float32)[integer(i)] = float32(number(b)); return nil }
-	})
-	g["float32"] = func(v Any) Any { return float64(float32(number(v))) }
-	g["copyFloats"] = curry2(func(src, dst Any) Any { return func() Any { copy(dst.([]float32), src.([]float32)); return nil } })
 	g["newPath"] = func() Any { return &canvas.Path{} }
 	g["moveTo"] = rasterEffect(func(d Dict) Any { d["path"].(*canvas.Path).MoveTo(number(d["x"]), number(d["y"])); return nil })
 	g["lineTo"] = rasterEffect(func(d Dict) Any { d["path"].(*canvas.Path).LineTo(number(d["x"]), number(d["y"])); return nil })

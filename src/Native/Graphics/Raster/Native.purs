@@ -7,7 +7,6 @@ import Native.Graphics.Types (Color, Image, Transform)
 foreign import data Surface :: Type
 foreign import data NativePath :: Type
 foreign import data TextLine :: Type
-foreign import data FloatBuffer :: Type
 
 foreign import critical :: forall a. Effect a -> Effect a
 foreign import newSurface :: { width :: Int, height :: Int } -> Effect Surface
@@ -16,11 +15,11 @@ foreign import newImage :: { width :: Int, height :: Int } -> Effect Image
 foreign import imageLength :: Image -> Int
 foreign import readByte :: Image -> Int -> Effect Int
 foreign import writeByte :: Image -> Int -> Int -> Effect Unit
-foreign import newFloats :: Int -> Effect FloatBuffer
-foreign import readFloat :: FloatBuffer -> Int -> Effect Number
-foreign import writeFloat :: FloatBuffer -> Int -> Number -> Effect Unit
-foreign import float32 :: Number -> Number
-foreign import copyFloats :: FloatBuffer -> FloatBuffer -> Effect Unit
+foreign import compositeImage :: { dst :: Image, src :: Image, invert :: Boolean } -> Effect Unit
+foreign import compositeMaskedImage :: { dst :: Image, src :: Image, mask :: Image, invertMask :: Boolean, invert :: Boolean } -> Effect Unit
+foreign import maskImage :: { image :: Image, mask :: Image } -> Effect Unit
+foreign import opacityImage :: { image :: Image, alpha :: Number } -> Effect Unit
+foreign import blurImage :: { width :: Int, height :: Int, image :: Image, radii :: Array Int } -> Effect Unit
 foreign import newPath :: Effect NativePath
 foreign import moveTo :: { path :: NativePath, x :: Number, y :: Number } -> Effect Unit
 foreign import lineTo :: { path :: NativePath, x :: Number, y :: Number } -> Effect Unit
