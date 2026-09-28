@@ -13,16 +13,20 @@ func metalGeometryPoint(value Any) (float32, float32) {
 	return float32(number(point["x"])), float32(number(point["y"]))
 }
 
-func metalGeometryIndexed(vertices []ebiten.Vertex, indices []uint16) Any {
-	points := make([]Any, len(vertices))
-	for i, vertex := range vertices {
-		points[i] = Dict{"x": float64(vertex.DstX), "y": float64(vertex.DstY)}
+func metalGeometryVertices(vertices []ebiten.Vertex, indices []uint16, color Dict) metalVertices {
+	red := float32(number(color["red"]))
+	green := float32(number(color["green"]))
+	blue := float32(number(color["blue"]))
+	alpha := float32(number(color["alpha"]))
+	out := make(metalVertices, 0, len(indices)*6)
+	for _, index := range indices {
+		if int(index) >= len(vertices) {
+			continue
+		}
+		vertex := vertices[index]
+		out = append(out, vertex.DstX, vertex.DstY, red, green, blue, alpha)
 	}
-	indexed := make([]Any, len(indices))
-	for i, index := range indices {
-		indexed[i] = int(index)
-	}
-	return Dict{"vertices": points, "indices": indexed}
+	return out
 }
 
 func init() {
@@ -71,8 +75,9 @@ func init() {
 	}
 	g["tessellateFill"] = func(value Any) Any {
 		return func() Any {
-			vertices, indices := value.(*metaldarwin.NativePath).Fill()
-			return metalGeometryIndexed(vertices, indices)
+			args := value.(Dict)
+			vertices, indices := args["path"].(*metaldarwin.NativePath).Fill()
+			return metalGeometryVertices(vertices, indices, args["color"].(Dict))
 		}
 	}
 	g["tessellateStroke"] = func(value Any) Any {
@@ -81,7 +86,7 @@ func init() {
 			vertices, indices := args["path"].(*metaldarwin.NativePath).Stroke(
 				float32(number(args["width"])), integer(args["join"]), integer(args["cap"]),
 			)
-			return metalGeometryIndexed(vertices, indices)
+			return metalGeometryVertices(vertices, indices, args["color"].(Dict))
 		}
 	}
 }

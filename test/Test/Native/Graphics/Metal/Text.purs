@@ -8,6 +8,7 @@ import Effect (Effect)
 import Effect.Exception (throw)
 import Native.Graphics.Geometry as Matrix
 import Native.Graphics.Metal.Text (decodeAtlas, textGeometry)
+import Native.Graphics.Metal.Vertices as Vertices
 import Native.Graphics.Types (TextAlign(..), TextBaseline(..))
 
 main :: Effect Unit
@@ -48,19 +49,87 @@ main = do
       , backingScale: 2.0
       }
   let middle = textGeometry Matrix.identity 0.5 spec atlas font shaped
-  unless (Array.length middle.vertices == 96) $ throw "Unicode atlas glyph and synthetic bold must each emit one quad"
-  expect "Center alignment includes synthetic bold advance" 0 89.0 middle.vertices
-  expect "Cap-middle baseline uses cap height, not ascent" 1 41.0 middle.vertices
-  expect "Bottom-origin atlas UVs flip vertically" 3 0.2 middle.vertices
-  expect "Inherited opacity multiplies text opacity" 7 0.4 middle.vertices
-  expect "Synthetic bold displaces the second run" 48 91.0 middle.vertices
+  let middleVertices = Vertices.toArray middle.vertices
+  unless (Array.length middleVertices == 96) $ throw "Unicode atlas glyph and synthetic bold must each emit one quad"
+  expect "Center alignment includes synthetic bold advance" 0 89.0 middleVertices
+  expect "Cap-middle baseline uses cap height, not ascent" 1 41.0 middleVertices
+  expect "Bottom-origin atlas UVs flip vertically" 3 0.2 middleVertices
+  expect "Inherited opacity multiplies text opacity" 7 0.4 middleVertices
+  expect "Synthetic bold displaces the second run" 48 91.0 middleVertices
+  let
+    quad x0 x1 =
+      [ x0
+      , 41.0
+      , 0.1
+      , 0.2
+      , 1.0
+      , 0.0
+      , 0.0
+      , 0.4
+      , x1
+      , 41.0
+      , 0.6
+      , 0.2
+      , 1.0
+      , 0.0
+      , 0.0
+      , 0.4
+      , x1
+      , 59.0
+      , 0.6
+      , 0.8
+      , 1.0
+      , 0.0
+      , 0.0
+      , 0.4
+      , x0
+      , 41.0
+      , 0.1
+      , 0.2
+      , 1.0
+      , 0.0
+      , 0.0
+      , 0.4
+      , x1
+      , 59.0
+      , 0.6
+      , 0.8
+      , 1.0
+      , 0.0
+      , 0.0
+      , 0.4
+      , x0
+      , 59.0
+      , 0.1
+      , 0.8
+      , 1.0
+      , 0.0
+      , 0.0
+      , 0.4
+      ]
+    expectedVertices = Vertices.toArray (Vertices.fromArray (quad 89.0 99.0 <> quad 91.0 101.0))
+  unless (middleVertices == expectedVertices) $ throw "Packed glyph triangles must preserve every position, UV, color and run order"
+  let
+    skipped = textGeometry Matrix.identity 0.5 spec atlas font
+      ( shaped
+          { glyphs =
+              [ { glyphID: 99, sourceIndex: 1, xOffset: 0.0, yOffset: 0.0, advance: 10.0 }
+              , { glyphID: 7, sourceIndex: 0, xOffset: 1.0, yOffset: 2.0, advance: 22.0 }
+              ]
+          , width = 32.0
+          }
+      )
+    expectedSkipped = Vertices.toArray (Vertices.fromArray (quad 94.0 104.0 <> quad 96.0 106.0))
+  unless (Vertices.toArray skipped.vertices == expectedSkipped) $ throw "Skipped glyphs must advance the cursor in both normal and bold runs"
   unless (middle.screenPxRange == 4.0) $ throw "MSDF range must account for font size and backing scale"
   let upper = textGeometry Matrix.identity 1.0 (spec { baseline = Top }) atlas font shaped
   let lower = textGeometry Matrix.identity 1.0 (spec { baseline = Bottom }) atlas font shaped
-  expect "Top baseline uses font ascent" 1 52.0 upper.vertices
-  expect "Bottom baseline uses font descent" 1 30.0 lower.vertices
+  expect "Top baseline uses font ascent" 1 52.0 (Vertices.toArray upper.vertices)
+  expect "Bottom baseline uses font descent" 1 30.0 (Vertices.toArray lower.vertices)
   case decodeAtlas (resources { width = 99 }) of
     Left _ -> pure unit
     Right _ -> throw "Atlas metadata must match uploaded image dimensions"
   where
-  expect label index expected vertices = unless (Array.index vertices index == Just expected) (throw label)
+  -- Compare the exact float32 values uploaded to Metal, without a tolerance.
+  expect label index expected vertices =
+    unless (Array.index vertices index == Array.head (Vertices.toArray (Vertices.fromArray [ expected ]))) (throw label)

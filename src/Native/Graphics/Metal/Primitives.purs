@@ -2,6 +2,7 @@ module Native.Graphics.Metal.Primitives where
 
 import Prelude
 import Effect (Effect)
+import Native.Graphics.Metal.Vertices (Vertices)
 
 foreign import data Target :: Type
 foreign import data Buffer :: Type
@@ -20,4 +21,4 @@ foreign import compose :: { sources :: Array Target, ops :: Array Int, destinati
 foreign import filter :: { source :: Target, destination :: Target, uniform :: Array Number } -> Effect Unit
 foreign import blit :: Target -> Effect Unit
 foreign import stencil :: { state :: Int, depth :: Int, reference :: Int } -> Effect Unit
-foreign import draw :: { buffer :: Buffer, offset :: Int, vertices :: Array Number, pipeline :: Int, stride :: Int, uniform :: Array Number } -> Effect Unit
+foreign import draw :: { buffer :: Buffer, offset :: Int, vertices :: Vertices, pipeline :: Int, stride :: Int, uniform :: Array Number } -> Effect Unit

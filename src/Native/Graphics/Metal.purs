@@ -3,7 +3,7 @@ module Native.Graphics.Metal (create) where
 import Prelude hiding (top)
 
 import Data.Array as Array
-import Data.Foldable (for_, traverse_)
+import Data.Foldable (traverse_)
 import Data.Int as Int
 import Data.List (List(..))
 import Data.List as List
@@ -11,18 +11,20 @@ import Data.Maybe (Maybe(..), fromMaybe)
 import Data.Number as Number
 import Data.Set as Set
 import Data.Traversable (traverse)
-import Effect (Effect)
+import Effect (Effect, foreachE)
 import Effect.Exception (catchException, throw, throwException)
 import Effect.Ref as Ref
 import Native.Graphics.Geometry as Matrix
 import Native.Graphics.Metal.Geometry as Geometry
 import Native.Graphics.Metal.Primitives as GPU
 import Native.Graphics.Metal.Text as Text
+import Native.Graphics.Metal.Vertices (Vertices)
+import Native.Graphics.Metal.Vertices as Vertices
 import Native.Graphics.Types (BlendMode(..), Color, Command(..), Drawing, FillRule(..), LayerId(..), Rect, Transform)
 
 type Targets = { main :: Array GPU.Target, capture :: Array GPU.Target, scratchA :: GPU.Target, scratchB :: GPU.Target, width :: Int, height :: Int }
 type BufferState = { buffer :: GPU.Buffer, capacity :: Int, offset :: Int }
-type Clip = { draws :: Array (Array Number), evenOdd :: Boolean }
+type Clip = { draws :: Array Vertices, evenOdd :: Boolean }
 type State =
   { transforms :: List Transform
   , alphas :: List Number
@@ -31,7 +33,7 @@ type State =
   , blurs :: List Number
   , blurLayer :: Int
   , viewportApplied :: Boolean
-  , batch :: List (Array Number)
+  , batch :: List Vertices
   }
 
 type PassState = { mainVisited :: Set.Set Int, captureVisited :: Set.Set Int, current :: Maybe { layer :: Int, capture :: Boolean } }
@@ -113,21 +115,22 @@ create = do
     Ref.read bufferRef >>= traverse_ (GPU.releaseBuffer <<< _.buffer)
     Ref.write Nothing bufferRef
   let
-    emit pipeline stride uniform vertices = unless (Array.null vertices) do
-      existing <- Ref.read bufferRef
-      let bytes = Array.length vertices * 4
-      let oldOffset = fromMaybe 0 (_.offset <$> existing)
-      let needed = oldOffset + bytes
-      storage <- case existing of
-        Just value | needed <= value.capacity -> pure value
-        _ -> do
-          let capacity = grow (max 4096 (fromMaybe 0 (_.capacity <$> existing))) needed
-          buffer <- GPU.newBuffer capacity
-          traverse_ (GPU.releaseBuffer <<< _.buffer) existing
-          pure { buffer, capacity, offset: 0 }
-      GPU.draw { buffer: storage.buffer, offset: storage.offset, vertices, pipeline, stride, uniform }
-      let offset = ((storage.offset + bytes + 15) `div` 16) * 16
-      Ref.write (Just (storage { offset = offset })) bufferRef
+    emit pipeline stride uniform vertices = do
+      let bytes = Vertices.length vertices * 4
+      unless (bytes == 0) do
+        existing <- Ref.read bufferRef
+        let oldOffset = fromMaybe 0 (_.offset <$> existing)
+        let needed = oldOffset + bytes
+        storage <- case existing of
+          Just value | needed <= value.capacity -> pure value
+          _ -> do
+            let capacity = grow (max 4096 (fromMaybe 0 (_.capacity <$> existing))) needed
+            buffer <- GPU.newBuffer capacity
+            traverse_ (GPU.releaseBuffer <<< _.buffer) existing
+            pure { buffer, capacity, offset: 0 }
+        GPU.draw { buffer: storage.buffer, offset: storage.offset, vertices, pipeline, stride, uniform }
+        let offset = ((storage.offset + bytes + 15) `div` 16) * 16
+        Ref.write (Just (storage { offset = offset })) bufferRef
     grow capacity needed = if capacity >= needed then capacity else grow (capacity * 2) needed
     targets width height layers needsBlur = do
       old <- Ref.read resourcesRef
@@ -174,11 +177,11 @@ create = do
             let bit = Int.floor (Number.pow 2.0 (Int.toNumber (depth - 1)))
             let state = if clip.evenOdd then 3 else if pushing then 2 else 4
             let reference = if clip.evenOdd then bit - 1 else bit * 2 - 1
-            for_ clip.draws \vertices -> do
+            foreachE clip.draws \vertices -> do
               GPU.stencil { state, depth, reference }
               emit 6 6 [] vertices
           setDepth (if pushing then depth else depth - 1)
-        reinstall clips = for_ (Array.mapWithIndex (\i clip -> { depth: i + 1, clip }) clips) \entry -> install entry.clip entry.depth true
+        reinstall clips = foreachE (Array.mapWithIndex (\i clip -> { depth: i + 1, clip }) clips) \entry -> install entry.clip entry.depth true
         activate state force layer = do
           when (layer < 0 || layer >= Array.length frame.layers) $ throw "Invalid Metal drawing layer"
           pass <- Ref.read passRef
@@ -197,7 +200,7 @@ create = do
         clearUnvisited capture = do
           pass <- Ref.read passRef
           let visited = if capture then pass.captureVisited else pass.mainVisited
-          for_ (Array.mapWithIndex (\layer target -> { layer, target }) (if capture then resources.capture else resources.main)) \entry ->
+          foreachE (Array.mapWithIndex (\layer target -> { layer, target }) (if capture then resources.capture else resources.main)) \entry ->
             unless (Set.member entry.layer visited) $ GPU.beginPass { target: entry.target, clear: true, color: if entry.layer == 0 && not capture then premultiplied frame.clear else transparent }
           GPU.endPass
           Ref.modify_ (_ { current = Nothing }) passRef
@@ -206,9 +209,9 @@ create = do
           let
             flush = do
               state <- Ref.read stateRef
-              emit 0 6 [] (Array.concat (Array.fromFoldable (List.reverse state.batch)))
+              emit 0 6 [] (Vertices.concat (Array.fromFoldable (List.reverse state.batch)))
               Ref.modify_ (_ { batch = Nil }) stateRef
-            enqueue vertices = unless (Array.null vertices) $ Ref.modify_ (\state -> state { batch = Cons vertices state.batch }) stateRef
+            enqueue vertices = unless (Vertices.length vertices == 0) $ Ref.modify_ (\state -> state { batch = Cons vertices state.batch }) stateRef
             command operation = do
               state <- Ref.read stateRef
               let matrix = top Matrix.identity state.transforms
@@ -296,14 +299,14 @@ create = do
                       GPU.blit resources.scratchA
                       reinstall state.clips
           activate (initial transform viewportApplied) true 0
-          traverse_ command drawing.commands
+          foreachE drawing.commands command
           flush
       render frame Matrix.identity false
       render overlay (Matrix.viewport width height { x: 0.0, y: 0.0, width: Int.toNumber frameWidth, height: Int.toNumber frameHeight }) true
       clearUnvisited false
       GPU.compose { sources: resources.main, ops, destination: resources.scratchA, drawable: true }
 
-quad :: Transform -> Rect -> Boolean -> Array Number
+quad :: Transform -> Rect -> Boolean -> Vertices
 quad matrix rect screenLocal =
   let
     vertex x y = let point = Matrix.apply matrix x y in [ point.x, point.y, if screenLocal then point.x else x, if screenLocal then point.y else y ]
@@ -312,4 +315,4 @@ quad matrix rect screenLocal =
     c = vertex (rect.x + rect.width) (rect.y + rect.height)
     d = vertex rect.x (rect.y + rect.height)
   in
-    a <> b <> c <> a <> c <> d
+    Vertices.fromArray (a <> b <> c <> a <> c <> d)

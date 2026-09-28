@@ -17,10 +17,9 @@ import Prelude hiding (top)
 import Control.Monad.ST as ST
 import Control.Monad.ST.Ref as STRef
 import Data.Array as Array
-import Data.Array.ST as STArray
 import Data.Either (Either(..))
 import Data.Enum (fromEnum)
-import Data.Foldable (foldl, for_)
+import Data.Foldable (foldl)
 import Data.Int as Int
 import Data.Map (Map)
 import Data.Map as Map
@@ -31,6 +30,8 @@ import Effect (Effect)
 import Effect.Exception (throw)
 import Effect.Ref as Ref
 import Native.Graphics.Geometry as Geometry
+import Native.Graphics.Metal.Vertices (Vertices)
+import Native.Graphics.Metal.Vertices as Vertices
 import Native.Graphics.Types (TextAlign(..), TextBaseline(..), TextSpec, Transform)
 import Yoga.JSON (readJSON)
 
@@ -95,7 +96,7 @@ type ShapedText =
   , backingScale :: Number
   }
 
-type Geometry = { vertices :: Array Number, screenPxRange :: Number }
+type Geometry = { vertices :: Vertices, screenPxRange :: Number }
 
 -- | Resource loading is lazy because the renderer is created before Configure.
 -- | A new native resource generation invalidates only the decoded atlas cache.
@@ -125,7 +126,7 @@ create = do
           pure (textGeometry transform inheritedAlpha spec atlas font shaped)
 
 emptyGeometry :: Geometry
-emptyGeometry = { vertices: [], screenPxRange: 0.0 }
+emptyGeometry = { vertices: Vertices.empty, screenPxRange: 0.0 }
 
 decodeAtlas :: Resources -> Either String Atlas
 decodeAtlas resources
@@ -191,11 +192,11 @@ textGeometry transform inheritedAlpha spec atlas font shaped =
     codePoints = if font.unicodeKeys then map fromEnum (CodePoints.toCodePointArray spec.text) else []
     alpha = spec.color.alpha * inheritedAlpha
     vertices = ST.run do
-      buffer <- STArray.new
+      buffer <- Vertices.new (Array.length shaped.glyphs * 48 * (if bold == 0.0 then 1 else 2))
       let
         appendRun runX = do
           cursor <- STRef.new runX
-          for_ shaped.glyphs \glyph -> do
+          ST.foreach shaped.glyphs \glyph -> do
             x <- STRef.read cursor
             let
               entry = do
@@ -214,61 +215,24 @@ textGeometry transform inheritedAlpha spec atlas font shaped =
                   r = spec.color.red
                   g = spec.color.green
                   b = spec.color.blue
-                void $ STArray.pushAll
+                Vertices.appendGlyphQuad buffer
                   [ x0
                   , y0
-                  , bounds.u0
-                  , bounds.v0
-                  , r
-                  , g
-                  , b
-                  , alpha
-                  , x1
-                  , y0
-                  , bounds.u1
-                  , bounds.v0
-                  , r
-                  , g
-                  , b
-                  , alpha
                   , x1
                   , y1
-                  , bounds.u1
-                  , bounds.v1
-                  , r
-                  , g
-                  , b
-                  , alpha
-                  , x0
-                  , y0
                   , bounds.u0
                   , bounds.v0
-                  , r
-                  , g
-                  , b
-                  , alpha
-                  , x1
-                  , y1
                   , bounds.u1
-                  , bounds.v1
-                  , r
-                  , g
-                  , b
-                  , alpha
-                  , x0
-                  , y1
-                  , bounds.u0
                   , bounds.v1
                   , r
                   , g
                   , b
                   , alpha
                   ]
-                  buffer
             void $ STRef.modify (_ + glyph.advance) cursor
       appendRun startX
       when (bold /= 0.0) (appendRun (startX + bold))
-      STArray.unsafeFreeze buffer
+      Vertices.freeze buffer
   in
     { vertices
     , screenPxRange: spec.size * backingScale * atlas.distanceRange / atlas.size

@@ -4,10 +4,12 @@ import Prelude
 
 import Data.Array as Array
 import Data.Foldable (all, foldl)
+import Data.Maybe (Maybe(..))
 import Effect (Effect)
 import Effect.Exception (throw)
 import Native.Graphics.Geometry as Transform
 import Native.Graphics.Metal.Geometry as Geometry
+import Native.Graphics.Metal.Vertices as Vertices
 import Native.Graphics.Types (FillRule(..), Path, PathOp(..))
 
 rectPath :: Number -> Number -> Number -> Number -> Path
@@ -19,8 +21,8 @@ rectPath x y width height =
   , ClosePath
   ]
 
--- Check the actual triangles returned by the native tessellator and packed by
--- PureScript. A contour toggles the stencil once, not once per covering triangle.
+-- Check the actual packed triangles returned by the native tessellator.
+-- A contour toggles the stencil once, not once per covering triangle.
 drawContains :: Array Number -> Number -> Number -> Boolean
 drawContains draw x y = go 0
   where
@@ -49,7 +51,7 @@ assert message condition = unless condition $ throw message
 main :: Effect Unit
 main = do
   let ring = rectPath 0.0 0.0 100.0 100.0 <> rectPath 25.0 25.0 50.0 50.0
-  draws <- Geometry.clip Transform.identity ring EvenOdd
+  draws <- map Vertices.toArray <$> Geometry.clip Transform.identity ring EvenOdd
   assert "Even-odd clip must include the outer ring" $ included draws 10.0 12.0
   assert "Even-odd clip must exclude the nested contour" $ not $ included draws 50.0 52.0
   assert "Even-odd clip must exclude points outside both contours" $ not $ included draws 110.0 12.0
@@ -57,7 +59,7 @@ main = do
     all (\draw -> mod (Array.length draw) 18 == 0 && transparent draw) draws
 
   let transform = Transform.compose (Transform.translate 13.0 22.0) (Transform.scale 2.0 4.0)
-  transformed <- Geometry.clip transform ring EvenOdd
+  transformed <- map Vertices.toArray <$> Geometry.clip transform ring EvenOdd
   assert "Path coordinates must be transformed before tessellation" $ included transformed 33.0 70.0
   assert "Transformed nested contour must remain a hole" $ not $ included transformed 113.0 230.0
   assert "Transformed clip must not retain untransformed coordinates" $ not $ included transformed 10.0 12.0
@@ -67,3 +69,14 @@ main = do
 
   empty <- Geometry.clip Transform.identity [] EvenOdd
   assert "An empty even-odd path must not submit a stencil draw" $ Array.null empty
+
+  let
+    color = { red: 0.13, green: 0.27, blue: 0.39, alpha: 0.53 }
+    packedColor = Vertices.toArray $ Vertices.fromArray [ color.red, color.green, color.blue, 0.41 * color.alpha ]
+  filled <- Vertices.toArray <$> Geometry.fill Transform.identity 0.41 (rectPath 0.0 0.0 10.0 10.0) color
+  assert "Colored geometry must cover its path" $ drawContains filled 3.0 4.0
+  assert "Every vertex must retain straight RGB and effective alpha at upload precision"
+    $ all identity
+    $ Array.mapWithIndex
+        (\index value -> mod index 6 < 2 || Array.index packedColor (mod index 6 - 2) == Just value)
+        filled

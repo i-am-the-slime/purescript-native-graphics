@@ -73,7 +73,7 @@ func init() {
 	f["draw"] = func(v Any) Any {
 		return func() Any {
 			d := v.(Dict)
-			metal.Draw(d["buffer"].(*metal.Buffer), integer(d["offset"]), metalFloats(d["vertices"]), integer(d["pipeline"]), integer(d["stride"]), metalFloats(d["uniform"]))
+			metal.Draw(d["buffer"].(*metal.Buffer), integer(d["offset"]), d["vertices"].(metalVertices), integer(d["pipeline"]), integer(d["stride"]), metalFloats(d["uniform"]))
 			return nil
 		}
 	}
