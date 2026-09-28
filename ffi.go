@@ -69,6 +69,7 @@ func init() {
 	w := Foreign("Native.Window")
 	w["platform"] = runtime.GOOS
 	w["deviceScaleFactor"] = func() Any { return deviceScaleFactor() }
+	w["maximumFramesPerSecond"] = func() Any { return maximumFramesPerSecond() }
 	w["configure"] = func(v Any) Any {
 		return func() Any {
 			d := v.(Dict)

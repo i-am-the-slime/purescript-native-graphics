@@ -10,6 +10,7 @@ package metaldarwin
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
 #include <stdlib.h>
+#include <string.h>
 
 extern void goRenderTick(void);
 
@@ -98,18 +99,10 @@ static float mg_get_mouse_y(void)  { return g_mouse_y; }
 static int   mg_get_mouse_down(void) { return g_mouse_down; }
 static int   mg_get_key(int code)  { return (code >= 0 && code < 256) ? (int)g_key_down[code] : 0; }
 
-// MgTickTarget interface declared here so the preamble can reference it;
-// the @implementation lives in tick_target_darwin.m so it isn't emitted into
-// every cgo-generated .c (which would dup the Obj-C class symbol).
-@interface MgTickTarget : NSObject
-- (void)tick:(id)sender;
-@end
-static MgTickTarget *g_tickTarget = nil;
-// g_tickTimer and mg_stop_tick live in tick_stop_darwin.m: cgo splices this
-// preamble into multiple generated translation units, so a non-static
-// definition here would emit two _mg_stop_tick symbols and fail to link.
-extern NSTimer *g_tickTimer;
+// Pacing state lives out-of-line because cgo duplicates this preamble.
+extern void mg_start_pacing(NSWindow *window, int fps);
 extern void mg_stop_tick(void);
+extern int mg_screen_maximum_fps(NSScreen *screen);
 
 // Native close requests return control to the host after stopping callbacks.
 @interface MgWinDelegate : NSObject <NSWindowDelegate>
@@ -805,14 +798,52 @@ static int mg_frame_begin(void) {
     g_frame_drawable = [g_layer nextDrawable];
     if (g_frame_drawable == nil) return 0;
     g_frame_cb = [g_queue commandBuffer];
+    if (g_frame_cb == nil) { g_frame_drawable = nil; return -1; }
     return 1;
 }
-static void mg_frame_end(void) {
+static void *mg_frame_end(void) {
+    if (g_frame_cb == nil) return NULL;
     mg_encoder_end();
     [g_frame_cb presentDrawable:g_frame_drawable];
+    // commandBuffer retains every referenced resource until GPU completion.
+    // The separate retained token survives both this frame and its autorelease pool.
+    void *submission = mg_retain(g_frame_cb);
     [g_frame_cb commit];
-    [g_frame_cb waitUntilCompleted];
     g_frame_cb = nil; g_frame_drawable = nil;
+    return submission;
+}
+static char *mg_submission_error(id<MTLCommandBuffer> buffer) {
+    if (buffer.status != MTLCommandBufferStatusError) return NULL;
+    NSString *message = buffer.error.description ?: @"Metal command buffer failed without an NSError";
+    return strdup(message.UTF8String);
+}
+static char *mg_submission_await(void *submission) {
+    @autoreleasepool {
+        id<MTLCommandBuffer> buffer = (__bridge id)submission;
+        [buffer waitUntilCompleted];
+        return mg_submission_error(buffer);
+    }
+}
+typedef struct {
+    int completed;
+    double gpuMilliseconds;
+    char *error;
+} MgSubmissionTiming;
+static MgSubmissionTiming mg_submission_timing(void *submission) {
+    @autoreleasepool {
+        id<MTLCommandBuffer> buffer = (__bridge id)submission;
+        MTLCommandBufferStatus status = buffer.status;
+        MgSubmissionTiming result = {0, 0, NULL};
+        if (status == MTLCommandBufferStatusError) {
+            result.completed = 1;
+            result.error = mg_submission_error(buffer);
+        } else if (status == MTLCommandBufferStatusCompleted) {
+            result.completed = 1;
+            double start = buffer.GPUStartTime, end = buffer.GPUEndTime;
+            if (start > 0 && end >= start) result.gpuMilliseconds = (end-start)*1000.0;
+        }
+        return result;
+    }
 }
 static void *mg_buffer_create(int capacity) {
     return mg_retain([g_device newBufferWithLength:capacity options:MTLResourceStorageModeShared]);
@@ -852,28 +883,29 @@ static void mg_atlas_upload(int x, int y, int w, int h, const unsigned char *byt
     [g_atlas replaceRegion:MTLRegionMake2D(x,y,w,h) mipmapLevel:0 withBytes:bytes bytesPerRow:w*4];
 }
 
-static void mg_start_tick(int fps) {
-    mg_stop_tick();
-    mg_quit_requested = 0;
-    g_tickTarget = [[MgTickTarget alloc] init];
-    g_tickTimer = [NSTimer timerWithTimeInterval:(1.0/(double)fps)
-                                          target:g_tickTarget
-                                        selector:@selector(tick:)
-                                        userInfo:nil
-                                         repeats:YES];
-    [[NSRunLoop mainRunLoop] addTimer:g_tickTimer forMode:NSRunLoopCommonModes];
+static void mg_start_tick(int fps) { mg_start_pacing(g_window, fps); }
+
+static int mg_maximum_fps(void) {
+    if (![NSThread isMainThread]) {
+        __block int fps;
+        dispatch_sync(dispatch_get_main_queue(), ^{ fps = mg_maximum_fps(); });
+        return fps;
+    }
+    return mg_screen_maximum_fps(g_window.screen ?: NSScreen.mainScreen);
 }
 
 static void mg_run(void) {
     [NSApp run];
     mg_stop_tick();
-    g_tickTarget = nil;
     if (g_keydown_monitor != nil) [NSEvent removeMonitor:g_keydown_monitor];
     if (g_keyup_monitor != nil) [NSEvent removeMonitor:g_keyup_monitor];
     if (g_mouse_monitor != nil) [NSEvent removeMonitor:g_mouse_monitor];
     g_keydown_monitor = nil; g_keyup_monitor = nil; g_mouse_monitor = nil;
     memset(g_key_down, 0, sizeof(g_key_down));
     g_mouse_down = 0;
+}
+
+static void mg_cleanup(void) {
     [g_window orderOut:nil];
     [g_window setDelegate:nil];
     [NSApp setDelegate:nil];
@@ -915,7 +947,7 @@ func goRenderTick() {
 	}
 }
 
-// SetTickFunc registers the per-frame callback invoked by the AppKit timer.
+// SetTickFunc registers the main-run-loop display callback.
 // Call before StartTick.
 func SetTickFunc(f func()) { tickFn = f }
 
@@ -970,13 +1002,16 @@ func Resize(winW, winH int) { C.mg_resize(C.int(winW), C.int(winH)) }
 func StartTick(fps int)     { C.mg_start_tick(C.int(fps)) }
 func Run() {
 	C.mg_run()
-	if cleanupFn != nil {
-		cleanupFn()
-		cleanupFn = nil
-	}
 	tickFn = nil
+	defer C.mg_cleanup()
+	if cleanupFn != nil {
+		cleanup := cleanupFn
+		cleanupFn = nil
+		cleanup()
+	}
 }
-func BackingScale() float32 { return float32(C.mg_backing_scale()) }
+func MaximumFramesPerSecond() int { return int(C.mg_maximum_fps()) }
+func BackingScale() float32       { return float32(C.mg_backing_scale()) }
 
 // MouseState returns view-point coordinates with top-down Y and left-button state.
 func MouseState() (x, y float32, down bool) {
@@ -1004,8 +1039,50 @@ func ViewportSize() (float32, float32) {
 	return float32(C.mg_vp_width()), float32(C.mg_vp_height())
 }
 
-func FrameBegin() bool { return C.mg_frame_begin() != 0 }
-func FrameEnd()        { C.mg_frame_end() }
+func FrameBegin() bool {
+	result := C.mg_frame_begin()
+	if result < 0 {
+		panic("Metal command buffer allocation failed")
+	}
+	return result != 0
+}
+func FrameEnd() *Submission {
+	submission := &Submission{native: C.mg_frame_end()}
+	if submission.native == nil {
+		panic("Metal endFrame requires an active frame")
+	}
+	return submission
+}
+
+// Submission owns one retained command buffer, independent of frame globals.
+// CPU-written resources must not be reused before AwaitSubmission returns.
+type Submission struct{ native unsafe.Pointer }
+
+func submissionPointer(submission *Submission) unsafe.Pointer {
+	if submission == nil || submission.native == nil {
+		panic("Metal submission has been released")
+	}
+	return submission.native
+}
+func submissionError(message *C.char) {
+	if message != nil {
+		text := C.GoString(message)
+		C.free(unsafe.Pointer(message))
+		panic("Metal command buffer failed: " + text)
+	}
+}
+func AwaitSubmission(submission *Submission) {
+	submissionError(C.mg_submission_await(submissionPointer(submission)))
+}
+func ReleaseSubmission(submission *Submission) {
+	C.mg_release(submissionPointer(submission))
+	submission.native = nil
+}
+func SubmissionTiming(submission *Submission) (bool, float64) {
+	timing := C.mg_submission_timing(submissionPointer(submission))
+	submissionError(timing.error)
+	return timing.completed != 0, float64(timing.gpuMilliseconds)
+}
 
 type Target struct{ native C.MgTarget }
 type Buffer struct{ native unsafe.Pointer }

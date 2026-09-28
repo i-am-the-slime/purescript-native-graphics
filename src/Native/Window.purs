@@ -8,6 +8,7 @@ module Native.Window
   , Config
   , configure
   , deviceScaleFactor
+  , maximumFramesPerSecond
   , platform
   , run
   ) where
@@ -187,6 +188,7 @@ frameInput input =
 
 foreign import configure :: Config -> Effect Unit
 foreign import deviceScaleFactor :: Effect Number
+foreign import maximumFramesPerSecond :: Effect Int
 foreign import platform :: String
 foreign import runMetalImpl :: Options -> (NativeInput -> Effect Output) -> MetalRenderer -> Effect Unit
 foreign import runEbitenImpl :: Options -> (NativeInput -> Effect Output) -> (Image -> Drawing -> Drawing -> Effect Unit) -> Effect Unit

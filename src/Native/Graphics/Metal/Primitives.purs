@@ -6,9 +6,13 @@ import Native.Graphics.Metal.Vertices (Vertices)
 
 foreign import data Target :: Type
 foreign import data Buffer :: Type
+foreign import data Submission :: Type
 
 foreign import beginFrame :: Effect Boolean
-foreign import endFrame :: Effect Unit
+foreign import endFrame :: Effect Submission
+foreign import awaitSubmission :: Submission -> Effect Unit
+foreign import releaseSubmission :: Submission -> Effect Unit
+foreign import submissionTiming :: Submission -> Effect { completed :: Boolean, gpuMilliseconds :: Number }
 foreign import backingScale :: Effect Number
 foreign import onClose :: Effect Unit -> Effect Unit
 foreign import newTarget :: { width :: Int, height :: Int, multisample :: Boolean } -> Effect Target

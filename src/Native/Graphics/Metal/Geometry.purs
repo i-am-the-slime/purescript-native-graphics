@@ -1,6 +1,7 @@
 module Native.Graphics.Metal.Geometry
   ( fill
   , stroke
+  , fillStroke
   , clip
   , splitContours
   , roundedRect
@@ -45,19 +46,31 @@ stroke transform alpha path color style
   | style.width <= 0.0 = pure Vertices.empty
   | otherwise = do
       native <- buildPath transform path
-      tessellateStroke
-        { path: native
-        , color: color { alpha = alpha * color.alpha }
-        , width: style.width * Geometry.xScale transform
-        , join: case style.join of
-            RoundJoin -> 0
-            BevelJoin -> 1
-            MiterJoin -> 2
-        , cap: case style.cap of
-            ButtCap -> 0
-            RoundCap -> 1
-            SquareCap -> 2
-        }
+      strokeNative transform alpha native color style
+
+-- Fill and stroke share the same transformed path.
+fillStroke :: Transform -> Number -> Path -> Color -> Color -> StrokeStyle -> Effect { fill :: Vertices, stroke :: Vertices }
+fillStroke transform alpha path fillColor strokeColor style = do
+  native <- buildPath transform path
+  filled <- tessellateFill { path: native, color: fillColor { alpha = alpha * fillColor.alpha } }
+  stroked <- if style.width <= 0.0 then pure Vertices.empty else strokeNative transform alpha native strokeColor style
+  pure { fill: filled, stroke: stroked }
+
+strokeNative :: Transform -> Number -> NativePath -> Color -> StrokeStyle -> Effect Vertices
+strokeNative transform alpha native color style =
+  tessellateStroke
+    { path: native
+    , color: color { alpha = alpha * color.alpha }
+    , width: style.width * Geometry.xScale transform
+    , join: case style.join of
+        RoundJoin -> 0
+        BevelJoin -> 1
+        MiterJoin -> 2
+    , cap: case style.cap of
+        ButtCap -> 0
+        RoundCap -> 1
+        SquareCap -> 2
+    }
 
 -- Each MoveTo begins a separate stencil-toggle draw, including open contours.
 splitContours :: Path -> Array Path

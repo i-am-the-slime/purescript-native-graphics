@@ -18,7 +18,19 @@ func metalFloats(value Any) []float32 {
 func init() {
 	f := Foreign("Native.Graphics.Metal.Primitives")
 	f["beginFrame"] = func() Any { return metal.FrameBegin() }
-	f["endFrame"] = func() Any { metal.FrameEnd(); return nil }
+	f["endFrame"] = func() Any { return metal.FrameEnd() }
+	f["awaitSubmission"] = func(v Any) Any {
+		return func() Any { metal.AwaitSubmission(v.(*metal.Submission)); return nil }
+	}
+	f["releaseSubmission"] = func(v Any) Any {
+		return func() Any { metal.ReleaseSubmission(v.(*metal.Submission)); return nil }
+	}
+	f["submissionTiming"] = func(v Any) Any {
+		return func() Any {
+			completed, milliseconds := metal.SubmissionTiming(v.(*metal.Submission))
+			return Dict{"completed": completed, "gpuMilliseconds": milliseconds}
+		}
+	}
 	f["backingScale"] = func() Any { return float64(metal.BackingScale()) }
 	f["onClose"] = func(v Any) Any { return func() Any { metal.SetCleanupFunc(func() { Run(v) }); return nil } }
 	f["newTarget"] = func(v Any) Any {

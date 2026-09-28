@@ -3,6 +3,7 @@ module Native.Graphics.Metal (create) where
 import Prelude hiding (top)
 
 import Data.Array as Array
+import Data.Either (either)
 import Data.Foldable (traverse_)
 import Data.Int as Int
 import Data.List (List(..))
@@ -12,7 +13,7 @@ import Data.Number as Number
 import Data.Set as Set
 import Data.Traversable (traverse)
 import Effect (Effect, foreachE)
-import Effect.Exception (catchException, throw, throwException)
+import Effect.Exception (throw, throwException, try)
 import Effect.Ref as Ref
 import Native.Graphics.Geometry as Matrix
 import Native.Graphics.Metal.Geometry as Geometry
@@ -24,6 +25,7 @@ import Native.Graphics.Types (BlendMode(..), Color, Command(..), Drawing, FillRu
 
 type Targets = { main :: Array GPU.Target, capture :: Array GPU.Target, scratchA :: GPU.Target, scratchB :: GPU.Target, width :: Int, height :: Int }
 type BufferState = { buffer :: GPU.Buffer, capacity :: Int, offset :: Int }
+type FrameSlot = { buffer :: Maybe BufferState, submission :: Maybe GPU.Submission }
 type Clip = { draws :: Array Vertices, evenOdd :: Boolean }
 type State =
   { transforms :: List Transform
@@ -108,12 +110,24 @@ create :: Effect (Drawing -> Drawing -> Number -> Number -> Int -> Int -> Effect
 create = do
   resourcesRef <- Ref.new Nothing
   bufferRef <- Ref.new Nothing
+  slotsRef <- Ref.new (Array.replicate 3 { buffer: Nothing, submission: Nothing } :: Array FrameSlot)
+  slotRef <- Ref.new 0
+  let
+    retire submission = do
+      outcome <- try (GPU.awaitSubmission submission)
+      GPU.releaseSubmission submission
+      either throwException pure outcome
+    storeSlot index value = Ref.modify_ (\slots -> fromMaybe slots (Array.updateAt index value slots)) slotsRef
   text <- Text.create
   GPU.onClose do
+    slots <- Ref.read slotsRef
+    Ref.write [] slotsRef
+    outcomes <- traverse (try <<< traverse_ retire <<< _.submission) slots
+    foreachE slots \slot -> traverse_ (GPU.releaseBuffer <<< _.buffer) slot.buffer
     Ref.read resourcesRef >>= traverse_ releaseTargets
     Ref.write Nothing resourcesRef
-    Ref.read bufferRef >>= traverse_ (GPU.releaseBuffer <<< _.buffer)
     Ref.write Nothing bufferRef
+    traverse_ (either throwException pure) outcomes
   let
     emit pipeline stride uniform vertices = do
       let bytes = Vertices.length vertices * 4
@@ -128,9 +142,9 @@ create = do
             buffer <- GPU.newBuffer capacity
             traverse_ (GPU.releaseBuffer <<< _.buffer) existing
             pure { buffer, capacity, offset: 0 }
-        GPU.draw { buffer: storage.buffer, offset: storage.offset, vertices, pipeline, stride, uniform }
         let offset = ((storage.offset + bytes + 15) `div` 16) * 16
         Ref.write (Just (storage { offset = offset })) bufferRef
+        GPU.draw { buffer: storage.buffer, offset: storage.offset, vertices, pipeline, stride, uniform }
     grow capacity needed = if capacity >= needed then capacity else grow (capacity * 2) needed
     targets width height layers needsBlur = do
       old <- Ref.read resourcesRef
@@ -150,12 +164,27 @@ create = do
           let value = { main, capture, scratchA, scratchB, width, height }
           Ref.write (Just value) resourcesRef
           pure value
-    finishFrame action = catchException (\error -> GPU.endFrame *> throwException error) (action <* GPU.endFrame)
+    acquireSlot = do
+      index <- Ref.read slotRef
+      slots <- Ref.read slotsRef
+      let slot = fromMaybe { buffer: Nothing, submission: Nothing } (Array.index slots index)
+      storeSlot index (slot { submission = Nothing })
+      traverse_ retire slot.submission
+      Ref.write slot.buffer bufferRef
+      pure index
+    finishFrame index action = do
+      outcome <- try action
+      submission <- GPU.endFrame
+      buffer <- Ref.read bufferRef
+      storeSlot index { buffer, submission: Just submission }
+      Ref.write (mod (index + 1) 3) slotRef
+      either throwException pure outcome
   pure \frame overlay viewportWidth viewportHeight frameWidth frameHeight -> do
     ops <- recipe frame
     when (viewportWidth <= 0.0 || viewportHeight <= 0.0 || frameWidth <= 0 || frameHeight <= 0) $ throw "Metal requires positive viewport and authored dimensions"
+    slot <- acquireSlot
     begun <- GPU.beginFrame
-    when begun $ finishFrame do
+    when begun $ finishFrame slot do
       scale <- max 1.0 <$> GPU.backingScale
       let width = viewportWidth
       let height = viewportHeight
@@ -183,12 +212,16 @@ create = do
           setDepth (if pushing then depth else depth - 1)
         reinstall clips = foreachE (Array.mapWithIndex (\i clip -> { depth: i + 1, clip }) clips) \entry -> install entry.clip entry.depth true
         activate state force layer = do
-          when (layer < 0 || layer >= Array.length frame.layers) $ throw "Invalid Metal drawing layer"
           pass <- Ref.read passRef
           let global = fromMaybe false (_.global <$> Array.index frame.layers layer)
           let capture = not (List.null state.blurs) && not global
-          let selected = { layer, capture }
-          unless (not force && pass.current == Just selected) do
+          let
+            alreadyActive = case pass.current of
+              Just current -> current.layer == layer && current.capture == capture
+              Nothing -> false
+          if not force && alreadyActive then pure unit
+          else do
+            let selected = { layer, capture }
             let visited = if capture then pass.captureVisited else pass.mainVisited
             let collection = if capture then resources.capture else resources.main
             case Array.index collection layer of
@@ -209,8 +242,10 @@ create = do
           let
             flush = do
               state <- Ref.read stateRef
-              emit 0 6 [] (Vertices.concat (Array.fromFoldable (List.reverse state.batch)))
-              Ref.modify_ (_ { batch = Nil }) stateRef
+              unless (List.null state.batch) do
+                activate state false (top 0 state.layers)
+                emit 0 6 [] (Vertices.concat (Array.fromFoldable (List.reverse state.batch)))
+                Ref.modify_ (_ { batch = Nil }) stateRef
             enqueue vertices = unless (Vertices.length vertices == 0) $ Ref.modify_ (\state -> state { batch = Cons vertices state.batch }) stateRef
             command operation = do
               state <- Ref.read stateRef
@@ -220,10 +255,12 @@ create = do
                 FillPath path color -> Geometry.fill matrix alpha path color >>= enqueue
                 StrokePath path color style -> Geometry.stroke matrix alpha path color style >>= enqueue
                 FillStrokePath path fillColor strokeColor style -> do
-                  Geometry.fill matrix alpha path fillColor >>= enqueue
-                  Geometry.stroke matrix alpha path strokeColor style >>= enqueue
+                  paths <- Geometry.fillStroke matrix alpha path fillColor strokeColor style
+                  enqueue paths.fill
+                  enqueue paths.stroke
                 DrawText spec -> do
                   flush
+                  activate state false (top 0 state.layers)
                   run <- text matrix alpha (spec { size = spec.size * Matrix.xScale matrix })
                   emit 5 8 [ run.screenPxRange ] run.vertices
                 PushTransform next -> Ref.modify_ (_ { transforms = Cons (Matrix.compose matrix next) state.transforms }) stateRef
@@ -235,16 +272,19 @@ create = do
                   draws <- Geometry.clip matrix path rule
                   let
                     clip =
-                      { draws
+                      -- Stencil parity is per fragment, not per draw call.
+                      { draws: if Array.length draws <= 1 then draws else [ Vertices.concat draws ]
                       , evenOdd: case rule of
                           EvenOdd -> true
                           NonZero -> false
                       }
                   let clips = Array.snoc state.clips clip
+                  activate state false (top 0 state.layers)
                   Ref.modify_ (_ { clips = clips }) stateRef
                   install clip (Array.length clips) true
                 PopClip -> do
                   flush
+                  activate state false (top 0 state.layers)
                   case Array.unsnoc state.clips of
                     Nothing -> setDepth 0
                     Just { init: clips, last: clip } -> do
@@ -253,13 +293,12 @@ create = do
                 PushLayer id -> do
                   flush
                   let layer = layerIndex id
+                  when (layer < 0 || layer >= Array.length frame.layers) $ throw "Invalid Metal drawing layer"
                   Ref.modify_ (_ { layers = Cons layer state.layers }) stateRef
-                  activate state false layer
                 PopLayer -> do
                   flush
                   let layers = pop state.layers
                   Ref.modify_ (_ { layers = layers }) stateRef
-                  activate state false (top 0 layers)
                 Viewport rect -> do
                   let transforms = if state.viewportApplied then pop state.transforms else state.transforms
                   let next = Matrix.compose (top Matrix.identity transforms) (Matrix.viewport width height rect)
@@ -267,12 +306,14 @@ create = do
                 Clear _ -> pure unit
                 CirclePattern spec -> do
                   flush
+                  activate state false (top 0 state.layers)
                   emit 3 4 ([ spec.tile, spec.radius, spec.originX, spec.originY ] <> rgba alpha spec.background <> rgba alpha spec.ink) (quad matrix spec.rect false)
                 LineLattice spec -> do
                   flush
                   let pitch = spec.pitchFraction * min width height
                   let major = pitch * spec.majorEvery
                   when (pitch > 0.0 && major > 0.0) do
+                    activate state false (top 0 state.layers)
                     let remainder value = value - Number.trunc (value / major) * major
                     let uniform = [ pitch, spec.majorEvery, spec.majorWidth, spec.minorWidth, remainder (spec.anchorX * width), remainder (spec.anchorY * height), 0.0, 0.0 ] <> rgba alpha spec.background <> rgba alpha spec.ink
                     emit 4 4 uniform (quad matrix spec.rect true)
@@ -286,9 +327,10 @@ create = do
                 PopBlur -> case state.blurs of
                   Nil -> pure unit
                   Cons sigma rest -> do
+                    -- The final batch still belongs to the blur capture.
+                    when (List.null rest) flush
                     Ref.modify_ (_ { blurs = rest }) stateRef
                     when (List.null rest) do
-                      flush
                       clearUnvisited true
                       GPU.compose { sources: resources.capture, ops, destination: resources.scratchA, drawable: false }
                       let sigmaPixels = sigma * scale
@@ -298,10 +340,15 @@ create = do
                       activate (state { blurs = rest, clips = [] }) true state.blurLayer
                       GPU.blit resources.scratchA
                       reinstall state.clips
-          activate (initial transform viewportApplied) true 0
+          -- The frame owns the background clear. Overlay drawing and layer
+          -- switches open a pass only when they actually paint or change a clip.
+          unless viewportApplied $ activate (initial transform viewportApplied) true 0
           foreachE drawing.commands command
           flush
       render frame Matrix.identity false
+      -- Overlay clips are independent of the frame. Reset lazily, without
+      -- opening an otherwise empty overlay pass.
+      Ref.modify_ (_ { current = Nothing }) passRef
       render overlay (Matrix.viewport width height { x: 0.0, y: 0.0, width: Int.toNumber frameWidth, height: Int.toNumber frameHeight }) true
       clearUnvisited false
       GPU.compose { sources: resources.main, ops, destination: resources.scratchA, drawable: true }

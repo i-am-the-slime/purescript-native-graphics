@@ -2,6 +2,7 @@
 #import <Cocoa/Cocoa.h>
 
 extern void mg_stop_tick(void);
+extern void mg_dispatch_close_request(void);
 int mg_quit_requested = 0;
 
 void mg_request_stop(void) {
@@ -22,7 +23,12 @@ void mg_request_stop(void) {
 @interface MgWinDelegate : NSObject <NSWindowDelegate>
 @end
 @implementation MgWinDelegate
-- (BOOL)windowShouldClose:(NSWindow *)sender { (void)sender; mg_quit_requested = 1; return NO; }
+- (BOOL)windowShouldClose:(NSWindow *)sender {
+    (void)sender;
+    mg_quit_requested = 1;
+    mg_dispatch_close_request();
+    return NO;
+}
 @end
 
 @interface MgAppDelegate : NSObject <NSApplicationDelegate>
@@ -32,6 +38,7 @@ void mg_request_stop(void) {
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender {
     (void)sender;
     mg_quit_requested = 1;
+    mg_dispatch_close_request();
     return NSTerminateCancel;
 }
 - (void)applicationWillTerminate:(NSNotification *)note { (void)note; mg_stop_tick(); }

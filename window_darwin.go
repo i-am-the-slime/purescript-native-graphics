@@ -8,6 +8,8 @@ import (
 	"time"
 )
 
+func maximumFramesPerSecond() int { return metaldarwin.MaximumFramesPerSecond() }
+
 func configureWindow(d Dict) error {
 	cfg := metaldarwin.Config{AtlasPNG: d["atlasPNG"].([]byte), AtlasJSON: d["atlasJSON"].([]byte), IconPNG: d["iconPNG"].([]byte), QuitMenuTitle: d["quitMenuTitle"].(string), QuitKeyEquivalent: d["quitKeyEquivalent"].(string), SampleCount: integer(d["sampleCount"])}
 	a := d["appearance"].(Dict)
